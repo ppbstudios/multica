@@ -37,6 +37,25 @@
 # ticket's static chi-brace-depth extraction evidently lost the enclosing
 # Route's prefix. Registered below under the corrected full path — same
 # handler, same operation, path fixed rather than reproducing the error.
+#
+# PPBM-3042 addition (12 endpoints missed by the originating ticket's static
+# parse, found during Stage 4 final router.go reconciliation):
+#   - /auth/google, /auth/send-code, /auth/verify-code: siblings of the
+#     already-documented /auth/logout, registered right next to it
+#     (router.go ~line 1515-1518) but not extracted before.
+#   - The 9 /api/plugin-bridge/v1/* routes other than hooks/{key}: the
+#     static parse read registerPluginActionRoutes' definition once and
+#     only picked up its FIRST call site (the official /v1 Public Plugin
+#     Action API, out of scope — see server/pkg/publicapi/v1/openapi.yaml),
+#     missing that the same function is called again for the
+#     pluginBridgePrefix group (router.go ~line 106-116, ~line 1639).
+#     Documented here as Plugin*-prefixed schemas distinct from this file's
+#     own Issue/Comment names (see the schema file's header), and using
+#     application/problem+json (PluginProblem) rather than this document's
+#     usual Error/ErrorCode — see securitySchemes.yaml's CloudNodePAT
+#     deviation note for why these use PersonalAccessToken/AgentTaskToken/
+#     CloudNodePAT/BrowserSession rather than the ticket's assumed mcn_-only
+#     scheme.
 
 /api/cloud-billing/balance:
   get:
@@ -2082,6 +2101,193 @@
       "302":
         description: Redirect to the Settings page, success or error-flagged.
 
+/auth/send-code:
+  post:
+    operationId: SendCode
+    summary: Email a one-time sign-in/sign-up verification code
+    tags: [infra]
+    description: >-
+      server/internal/handler/auth.go:305-395 (`SendCode`). PUBLIC route
+      (outside the Auth middleware group — router.go ~line 1515, the "Auth
+      (public)" block). Checks signup-restriction rules
+      (ALLOW_SIGNUP/email-allowlist) before mailing the code so a
+      disallowed new signup never receives one; an existing user is always
+      allowed to request one. Per-IP rate limited to RATE_LIMIT_AUTH
+      (default 5) requests/minute (middleware.RateLimit); the limiter is a
+      silent no-op when REDIS_URL is not configured (router.go ~line
+      1508-1512). Also independently rate-limited to one code per email
+      per 60 seconds, checked against the latest stored code
+      (GetLatestCodeByEmail) regardless of the per-IP limiter's state.
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SendCodeRequest' }
+    responses:
+      "200":
+        description: Code generated, emailed, and stored (10-minute expiry).
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message: { type: string, const: "Verification code sent" }
+      "400":
+        description: Invalid body, or missing email.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              emailRequired: { value: { error: "email is required" } }
+      "403":
+        description: Temporarily disabled account, or signup not allowed for this email (self-hosted ALLOW_SIGNUP=false or domain/email not allow-listed).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              disabledAccount: { value: { error: "account disabled" } }
+              signupProhibited: { value: { error: "user registration is disabled on this self-hosted instance" } }
+              emailNotAllowed: { value: { error: "email address or domain not allowed on this instance" } }
+      "429":
+        description: Per-IP rate limit (RATE_LIMIT_AUTH/minute) exceeded, or a code was already sent to this email within the last 60 seconds. Sets Retry-After on the per-IP path only.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              perIP: { value: { error: "too many requests" } }
+              perEmail: { value: { error: "please wait before requesting another code" } }
+      "500":
+        description: User lookup, signup-eligibility check, code storage, or email delivery failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/auth/verify-code:
+  post:
+    operationId: VerifyCode
+    summary: Verify an emailed code and start a session
+    tags: [infra]
+    description: >-
+      server/internal/handler/auth.go:397-481 (`VerifyCode`). PUBLIC route
+      (router.go ~line 1516, "Auth (public)" block). Creates the user on
+      first login (checkSignupAllowed re-applied). On success, sets the
+      HttpOnly auth + CSRF cookies (and CloudFront signed cookies when
+      configured) and returns the same token in the body for
+      non-cookie clients. Per-IP rate limited to RATE_LIMIT_AUTH_VERIFY
+      (default 20) requests/minute; the limiter is a silent no-op when
+      REDIS_URL is not configured (router.go ~line 1508-1513). Off
+      production (APP_ENV != production), a dev override code
+      (devVerificationCodeEnv) bypasses the stored-code comparison
+      entirely.
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/VerifyCodeRequest' }
+    responses:
+      "200":
+        description: Session started.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginResponse' }
+      "400":
+        description: Invalid body, missing email/code, or the code is invalid/expired/wrong (same message for all three to avoid confirming a code exists).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              required: { value: { error: "email and code are required" } }
+              invalidCode: { value: { error: "invalid or expired code" } }
+      "403":
+        description: Temporarily disabled account, or signup restriction rejected this email on first login.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      "429":
+        description: Per-IP rate limit (RATE_LIMIT_AUTH_VERIFY/minute) exceeded.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "too many requests" }
+      "500":
+        description: Code verification, user creation, or JWT issuance failed.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/auth/google:
+  post:
+    operationId: GoogleLogin
+    summary: Exchange a Google OAuth code for a Multica session
+    tags: [infra]
+    description: >-
+      server/internal/handler/auth.go:556-743 (`GoogleLogin`). PUBLIC
+      route (router.go ~line 1517, "Auth (public)" block). Exchanges the
+      authorization code with Google, fetches the Google profile, then
+      finds-or-creates the Multica user by email — backfilling name/avatar
+      from the Google profile only for a newly-created user or one with no
+      avatar yet. Sets the same cookies as /auth/verify-code on success.
+      Per-IP rate limited to RATE_LIMIT_AUTH (default 5) requests/minute;
+      no-op when REDIS_URL is not configured (router.go ~line 1508-1512,
+      1517). 404s to the feature-disabled response when GOOGLE_CLIENT_ID /
+      GOOGLE_CLIENT_SECRET are not set on this deployment.
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/GoogleLoginRequest' }
+    responses:
+      "200":
+        description: Session started.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginResponse' }
+      "400":
+        description: Invalid body, missing code, Google rejected the authorization code (invalid_grant), or Google returned no email for this account.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              codeRequired: { value: { error: "code is required" } }
+              invalidGrant: { value: { error: "failed to exchange code with Google", code: "oauth_code_invalid" } }
+              noEmail: { value: { error: "Google did not provide an email address for this sign-in", code: "google_account_no_email" } }
+      "403":
+        description: Google login is not configured on this deployment, the account is temporarily disabled, or signup is restricted for this email.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            examples:
+              notConfigured: { value: { error: "Google login is not configured", code: "google_login_not_configured" } }
+              disabledAccount: { value: { error: "account disabled", code: "account_disabled" } }
+              signupProhibited: { value: { error: "user registration is disabled on this self-hosted instance", code: "signup_prohibited" } }
+              emailNotAllowed: { value: { error: "email address or domain not allowed on this instance", code: "email_not_allowed" } }
+      "429":
+        description: Per-IP rate limit (RATE_LIMIT_AUTH/minute) exceeded.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "too many requests" }
+      "500":
+        description: Failed to create the user or issue the session JWT.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      "502":
+        description: Google's token-exchange or userinfo endpoint failed, errored, or returned an unparseable response.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
 /auth/logout:
   post:
     operationId: Logout
@@ -2241,6 +2447,475 @@
           application/json:
             schema:
               $ref: '#/components/schemas/Error'
+
+/api/plugin-bridge/v1/context:
+  get:
+    operationId: GetPluginContextBridge
+    summary: Get the authorized Plugin invocation context (browser-session bridge)
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_action.go, GetPluginContext
+      (~line 269). Added per PPBM-3042: `registerPluginActionRoutes`
+      (router.go ~line 106) is called a second time under
+      `pluginBridgePrefix` (router.go ~line 1639), registering the same
+      nine Plugin Action handlers at `/api/plugin-bridge/v1/*` that the
+      official, out-of-scope `/v1` contract
+      (server/pkg/publicapi/v1/openapi.yaml) exposes at `/v1/*` — same
+      handler, same request/response shape, different mount and different
+      caller population (see this operation's `security` deviation note).
+      Pass `?issue_id=<uuid-or-identifier>` to also populate `issue` in
+      the response; omit it to get the bare workspace/user/config context.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/PluginInstallationHeader'
+      - name: issue_id
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Issue UUID or workspace identifier (e.g. MUL-123) to populate the response's `issue` field.
+    responses:
+      "200":
+        description: Plugin context.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginContext' }
+      "400":
+        description: Missing/malformed X-Multica-Plugin-Installation, or an unparseable X-User-ID.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            examples:
+              missingInstallation: { value: { type: "urn:multica:problem:invalid_request", title: "Bad Request", status: 400, code: "invalid_request", detail: "plugin installation is required", error: "plugin installation is required", request_id: "00000000-0000-0000-0000-000000000000" } }
+      "401":
+        description: No authenticated user resolvable (session/PAT/task-token/cloud-PAT all absent or invalid).
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            example: { type: "urn:multica:problem:unauthorized", title: "Unauthorized", status: 401, code: "unauthorized", detail: "missing authenticated user", error: "missing authenticated user", request_id: "00000000-0000-0000-0000-000000000000" }
+      "403":
+        description: Plugin management disabled for this deployment, the installation is disabled, or (when issue_id is set) the issue is scoped away by the caller's callback grant.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            examples:
+              disabled: { value: { type: "urn:multica:problem:plugin_api_disabled", title: "Forbidden", status: 403, code: "plugin_api_disabled", detail: "Plugin management is not enabled", error: "Plugin management is not enabled", request_id: "00000000-0000-0000-0000-000000000000" } }
+              installationDisabled: { value: { type: "urn:multica:problem:forbidden", title: "Forbidden", status: 403, code: "forbidden", detail: "this Plugin is disabled", error: "this Plugin is disabled", request_id: "00000000-0000-0000-0000-000000000000" } }
+      "404":
+        description: The installation named by X-Multica-Plugin-Installation does not exist, the caller is not a member of its workspace, or issue_id does not resolve.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            example: { type: "urn:multica:problem:not_found", title: "Not Found", status: 404, code: "not_found", detail: "plugin installation not found", error: "plugin installation not found", request_id: "00000000-0000-0000-0000-000000000000" }
+
+/api/plugin-bridge/v1/issues/{issue_ref}:
+  parameters:
+    - $ref: '#/components/parameters/PluginInstallationHeader'
+    - name: issue_ref
+      in: path
+      required: true
+      description: Issue UUID or workspace identifier such as MUL-123, resolved inside the caller's own workspace (resolvePluginIssue).
+      schema:
+        type: string
+  get:
+    operationId: GetPluginIssueBridge
+    summary: Get an issue through the Plugin Action API (browser-session bridge)
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_action.go, GetPluginIssue (~line
+      328). Requires the `issues:read` Plugin scope. See
+      GetPluginContextBridge's description for why this route exists
+      alongside the official `/v1` path.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Issue.
+        headers:
+          ETag:
+            description: 'Weak ETag: `W/"<revision>"` (setPublicIssueETag).'
+            schema: { type: string }
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginIssue' }
+      "400":
+        description: Missing/malformed X-Multica-Plugin-Installation.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, or the installation lacks the issues:read scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            example: { type: "urn:multica:problem:forbidden", title: "Forbidden", status: 403, code: "forbidden", detail: "this Plugin was not granted the issues:read scope", error: "this Plugin was not granted the issues:read scope", request_id: "00000000-0000-0000-0000-000000000000" }
+      "404":
+        description: Installation not found, issue not found/outside the caller's workspace, or outside a callback token's issue scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            example: { type: "urn:multica:problem:not_found", title: "Not Found", status: 404, code: "not_found", detail: "issue not found", error: "issue not found", request_id: "00000000-0000-0000-0000-000000000000" }
+  patch:
+    operationId: PatchPluginIssueBridge
+    summary: Update an issue's title or description through the Plugin Action API (browser-session bridge)
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_action.go, PatchPluginIssue (~line
+      350). Requires the `issues:write` Plugin scope. Title and
+      description only — status/priority/assignee/parent/project/stage
+      each carry side effects the Plugin Action API deliberately does not
+      replicate (see the handler's doc comment).
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/IfMatchHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PluginPatchIssueRequest' }
+    responses:
+      "200":
+        description: Updated issue.
+        headers:
+          ETag:
+            description: 'Weak ETag: `W/"<revision>"`.'
+            schema: { type: string }
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginIssue' }
+      "400":
+        description: Invalid body, neither title nor description present, empty title, missing/malformed X-Multica-Plugin-Installation, or a malformed If-Match / expected_revision mismatch between header and body.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, or the installation lacks the issues:write scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "404":
+        description: Installation not found, issue not found/outside the caller's workspace, or outside a callback token's issue scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "409":
+        description: expected_revision / If-Match named a revision older than the issue's current one.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            example: { type: "urn:multica:problem:revision_conflict", title: "Conflict", status: 409, code: "revision_conflict", detail: "resource changed since it was loaded", error: "resource changed since it was loaded", request_id: "00000000-0000-0000-0000-000000000000" }
+
+/api/plugin-bridge/v1/issues/{issue_ref}/comments:
+  parameters:
+    - $ref: '#/components/parameters/PluginInstallationHeader'
+    - name: issue_ref
+      in: path
+      required: true
+      description: Issue UUID or workspace identifier such as MUL-123.
+      schema:
+        type: string
+  get:
+    operationId: ListPluginCommentsBridge
+    summary: List the newest 200 comments on an issue through the Plugin Action API (browser-session bridge)
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_action.go, ListPluginComments (~line
+      483). Requires the `comments:read` Plugin scope. Returns the newest
+      200 (maxPluginCommentsPerRead) in chronological order, not a
+      paginated full history.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Comments.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginCommentListResponse' }
+      "400":
+        description: Missing/malformed X-Multica-Plugin-Installation.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, or the installation lacks the comments:read scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "404":
+        description: Installation not found, issue not found/outside the caller's workspace, or outside a callback token's issue scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+  post:
+    operationId: CreatePluginCommentBridge
+    summary: Create an issue comment through the Plugin Action API, without mention dispatch (browser-session bridge)
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_action.go, CreatePluginComment (~line
+      534). Requires the `comments:write` Plugin scope. Authored as the
+      signed-in member when the caller acts as a person (marked
+      `via_plugin_id` so the timeline can attribute it to the Plugin), or
+      as `author_type: plugin` when the caller acts as the installation
+      itself (an event-triggered hook, which has nobody to attribute to).
+      Deliberately skips @mention trigger dispatch — a Plugin comment
+      cannot start an agent run as a side effect of posting text.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PluginCreateCommentRequest' }
+    responses:
+      "201":
+        description: Created comment.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginComment' }
+      "400":
+        description: Invalid body, empty/oversized content, an invalid parent_id, or missing/malformed X-Multica-Plugin-Installation.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, or the installation lacks the comments:write scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "404":
+        description: Installation not found, issue not found/outside the caller's workspace, or outside a callback token's issue scope.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+
+/api/plugin-bridge/v1/storage/{scope}:
+  get:
+    operationId: ListPluginStorageBridge
+    summary: List Plugin storage keys for a scope (browser-session bridge)
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_action.go, ListPluginStorage (~line
+      665). No Plugin scope of its own: `scope=user` requires the
+      installation was granted `storage:user`, `scope=workspace` requires
+      `storage:workspace` (pluginStorageScope ~line 631). A `storage:user`
+      call additionally requires a member behind the call — a
+      plugin-actor caller (install token, or an event-hook callback) has
+      no per-user bucket to resolve.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/PluginInstallationHeader'
+      - name: scope
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [user, workspace]
+    responses:
+      "200":
+        description: Storage keys.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginStorageKeyListResponse' }
+      "400":
+        description: Missing/malformed X-Multica-Plugin-Installation, or an unrecognized scope value.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, the installation lacks the required storage scope, or scope=user with no member behind the call.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            examples:
+              missingScope: { value: { type: "urn:multica:problem:missing_scope", title: "Forbidden", status: 403, code: "missing_scope", detail: "this Plugin was not granted the storage:user scope", error: "this Plugin was not granted the storage:user scope", request_id: "00000000-0000-0000-0000-000000000000" } }
+              memberRequired: { value: { type: "urn:multica:problem:member_required", title: "Forbidden", status: 403, code: "member_required", detail: "this endpoint requires a user; the presented token acts as the Plugin itself", error: "this endpoint requires a user; the presented token acts as the Plugin itself", request_id: "00000000-0000-0000-0000-000000000000" } }
+      "404":
+        description: Installation not found.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+
+/api/plugin-bridge/v1/storage/{scope}/{key}:
+  parameters:
+    - $ref: '#/components/parameters/PluginInstallationHeader'
+    - name: scope
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [user, workspace]
+    - name: key
+      in: path
+      required: true
+      schema:
+        type: string
+        maxLength: 1024
+  get:
+    operationId: GetPluginStorageBridge
+    summary: Get a Plugin storage value (browser-session bridge)
+    tags: [infra]
+    description: server/internal/handler/plugin_action.go, GetPluginStorage (~line 688). Same scope rules as ListPluginStorageBridge.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "200":
+        description: Storage value.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PluginStorageValueResponse' }
+      "400":
+        description: Missing/malformed X-Multica-Plugin-Installation, or an unrecognized scope value.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, the installation lacks the required storage scope, or scope=user with no member behind the call.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "404":
+        description: Installation not found, or no value stored for this key.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+  put:
+    operationId: PutPluginStorageBridge
+    summary: Put a Plugin storage value (browser-session bridge)
+    tags: [infra]
+    description: >-
+      server/internal/handler/plugin_action.go, PutPluginStorage (~line
+      706). Same scope rules as ListPluginStorageBridge. Enforces
+      MaxPluginStorageKeyBytes / MaxPluginStorageValueBytes /
+      MaxPluginStorageKeys / MaxPluginStorageTotalBytes
+      (server/internal/service/plugin_storage.go) as 507 quota errors
+      rather than 400s — these are standing-capacity limits, not
+      malformed-input errors.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PluginPutStorageValueRequest' }
+    responses:
+      "204":
+        description: Stored.
+      "400":
+        description: Invalid body, missing/malformed X-Multica-Plugin-Installation, or an unrecognized scope value.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, the installation lacks the required storage scope, or scope=user with no member behind the call.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "404":
+        description: Installation not found.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "507":
+        description: Storage quota exceeded (oversized key, oversized value, too many keys in scope, or scope byte budget exceeded).
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+            example: { type: "urn:multica:problem:quota_exceeded", title: "Insufficient Storage", status: 507, code: "quota_exceeded", detail: "storage value exceeds 102400 bytes", error: "storage value exceeds 102400 bytes", request_id: "00000000-0000-0000-0000-000000000000" }
+  delete:
+    operationId: DeletePluginStorageBridge
+    summary: Delete a Plugin storage value (browser-session bridge)
+    tags: [infra]
+    description: server/internal/handler/plugin_action.go, DeletePluginStorage (~line 729). Same scope rules as ListPluginStorageBridge.
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    responses:
+      "204":
+        description: Deleted.
+      "400":
+        description: Missing/malformed X-Multica-Plugin-Installation, or an unrecognized scope value.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "401":
+        description: No authenticated user resolvable.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "403":
+        description: Plugin management disabled, installation disabled, the installation lacks the required storage scope, or scope=user with no member behind the call.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
+      "404":
+        description: Installation not found.
+        content:
+          application/problem+json:
+            schema: { $ref: '#/components/schemas/PluginProblem' }
 
 /api/plugin-bridge/v1/hooks/{key}:
   post:
