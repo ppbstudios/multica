@@ -2563,3 +2563,242 @@ IssueMoveStaleAnchorsResponse:
         - move anchors are stale or out of order
         - move anchors are too close; refresh and retry
         - move position is out of range
+
+# ---------------------------------------------------------------------------
+# GET /api/issues/{id}/workflow-handoff (PPBM-3043 — missing from the
+# original domain pass). server/internal/handler/issue_workflow.go:1370-1470
+# (`PreviewWorkflowHandoff`).
+# ---------------------------------------------------------------------------
+
+WorkflowHandoffRun:
+  type: object
+  required: [task_id, agent_id, status, started_at]
+  properties:
+    task_id: { type: string, format: uuid }
+    agent_id: { type: string, format: uuid }
+    status: { type: string }
+    started_at: { type: [string, "null"], format: date-time }
+
+WorkflowHandoffPreviewResponse:
+  type: object
+  description: >-
+    Dry-run preview of what moving the issue to `status` (or into
+    `project_id`, entering whatever step it lands on) would do under the
+    project's workflow. Writes nothing. `handoff: false` (the zero value)
+    means the move is a plain status/project change with no workflow
+    handler assigned.
+  required: [handoff, from_status, to_status, previous_assignee_type, previous_assignee_id, previous_runs]
+  properties:
+    handoff:
+      type: boolean
+      description: True only when the destination step has a handler (hands off to an agent/squad).
+    workflow_name:
+      type: string
+      description: Present only when `handoff` is true.
+    from_status: { type: string }
+    to_status: { type: string }
+    handler_type:
+      type: string
+      description: Present only when `handoff` is true — the resolved assignee_type.
+    handler_id:
+      type: string
+      format: uuid
+      description: Present only when `handoff` is true — the resolved assignee_id.
+    previous_assignee_type: { type: [string, "null"] }
+    previous_assignee_id: { type: [string, "null"], format: uuid }
+    previous_runs:
+      type: array
+      items: { $ref: '#/components/schemas/WorkflowHandoffRun' }
+      description: Active runs of the issue's CURRENT agent, populated only when the handoff would actually change the assignee. Always `[]` otherwise, never omitted.
+    brief:
+      type: string
+      description: The brief text the new handler would receive, present only when `handoff` is true.
+
+StatusNotInWorkflowResponse:
+  type: object
+  description: >-
+    400 written by `writeIssueWorkflowError` (issue_workflow_entry.go:122-144)
+    when the requested `status` is not one the project's named workflow
+    lists. NOT the shared `ErrorCode` schema — carries `workflow_name`/
+    `allowed_statuses` it doesn't have room for. (This handler never
+    triggers that same function's other branch, `workflow_step_moved` 409
+    — it always calls `applyIssueWorkflow` with a nil run, and that branch
+    requires a non-nil run.)
+  required: [error, code, workflow_name, allowed_statuses]
+  properties:
+    error: { type: string }
+    code:
+      type: string
+      const: status_not_in_workflow
+    workflow_name: { type: string }
+    allowed_statuses:
+      type: array
+      items: { type: string }
+
+# ---------------------------------------------------------------------------
+# POST /api/issues/{id}/tasks/{taskId}/supplements[/{commentId}/retry]
+# (PPBM-3043 — missing from the original domain pass). server/internal/
+# handler/task_supplement.go. Human-actor-only (handler.RequireHumanActor)
+# on both routes.
+#
+# Path-list discrepancy found and corrected here: the originating ticket
+# lists the retry route as "POST .../supplements/retry" (no {commentId}).
+# router.go has exactly one matching registration,
+# r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements/{commentId}/retry",
+# h.RetryTaskSupplement) (~line 2070, inside r.Route("/api/issues/{id}", ...)).
+# The true path is /api/issues/{id}/tasks/{taskId}/supplements/{commentId}/retry
+# — registered below under the corrected full path, same handler.
+# ---------------------------------------------------------------------------
+
+CreateTaskSupplementRequest:
+  type: object
+  description: >-
+    Adds one ordinary historical comment to one exact run, bound by
+    `client_request_id` for idempotent retry of the same client-side
+    submission.
+  required: [content, client_request_id]
+  properties:
+    content:
+      type: string
+      minLength: 1
+      description: Subject to the same max length and null-byte sanitization as a normal comment.
+    client_request_id:
+      type: string
+      format: uuid
+      description: Resubmitting the same value against the same task/author returns the existing comment instead of creating a duplicate.
+
+TaskSupplementReceiptResponse:
+  type: object
+  description: 200 body for the retry endpoint — a small delivery-receipt projection, NOT the full CommentResponse the create endpoint returns.
+  required: [supplement_task_id, supplement_status]
+  properties:
+    supplement_task_id:
+      type: string
+      format: uuid
+    supplement_status:
+      type: string
+    supplement_failure_reason:
+      type: [string, "null"]
+    supplement_delivered_at:
+      type: [string, "null"]
+      format: date-time
+
+# ---------------------------------------------------------------------------
+# GET /api/comments/{commentId}/sub-issue-preview,
+# POST /api/comments/{commentId}/sub-issues (PPBM-3043 — missing from the
+# original domain pass). server/internal/handler/source_context.go. Both
+# routes are human-actor-only (handler.RequireHumanActor).
+# ---------------------------------------------------------------------------
+
+SourceContextAuthorSnapshot:
+  type: object
+  required: [type, id, name]
+  properties:
+    type: { type: string, description: '"member" or "agent".' }
+    id: { type: string, format: uuid }
+    name: { type: string }
+
+SourceContextAttachmentSnapshot:
+  type: object
+  required: [id, owner_type, owner_id, filename, content_type, size_bytes, created_at]
+  properties:
+    id: { type: string, format: uuid }
+    source_attachment_id:
+      type: string
+      format: uuid
+      description: Present only once the attachment has been cloned into the created sub-issue/comment; absent on the pure preview.
+    owner_type: { type: string }
+    owner_id: { type: string, format: uuid }
+    filename: { type: string }
+    content_type: { type: string }
+    size_bytes: { type: integer, format: int64 }
+    created_at: { type: string, format: date-time }
+
+SourceContextIssueSnapshot:
+  type: object
+  required: [id, identifier, number, title, description, created_at, updated_at, revision, attachments]
+  properties:
+    id: { type: string, format: uuid }
+    identifier: { type: string }
+    number: { type: integer }
+    title: { type: string }
+    description: { type: [string, "null"] }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+    revision: { type: integer, format: int64 }
+    attachments:
+      type: array
+      items: { $ref: '#/components/schemas/SourceContextAttachmentSnapshot' }
+
+SourceContextCommentSnapshot:
+  type: object
+  required: [id, parent_id, type, content, author, created_at, updated_at, revision, attachments]
+  properties:
+    id: { type: string, format: uuid }
+    parent_id: { type: [string, "null"], format: uuid }
+    type: { type: string }
+    content: { type: string, description: Empty on a deleted/tombstoned comment kept only so replies retain their parent. }
+    author: { $ref: '#/components/schemas/SourceContextAuthorSnapshot' }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+    revision: { type: integer, format: int64 }
+    attachments:
+      type: array
+      items: { $ref: '#/components/schemas/SourceContextAttachmentSnapshot' }
+    deleted:
+      type: boolean
+      description: Omitted (not false) when not a tombstone.
+
+SourceContextLimitUsage:
+  type: object
+  required: [comment_count, text_bytes, attachment_count, attachment_bytes]
+  properties:
+    comment_count: { type: integer }
+    text_bytes: { type: integer }
+    attachment_count: { type: integer }
+    attachment_bytes: { type: integer, format: int64 }
+
+CommentSubIssuePreviewResponse:
+  type: object
+  description: >-
+    `PreviewCommentSubIssue` — captures the anchor comment's full thread
+    (source issue + every comment in the thread, not just the anchor) into
+    an immutable snapshot and returns an opaque `capture_token` the create
+    call must echo back unchanged, binding the create to exactly this
+    preview.
+  required: [source_issue, comment_thread, anchor_comment_id, capture_token, limits]
+  properties:
+    source_issue: { $ref: '#/components/schemas/SourceContextIssueSnapshot' }
+    comment_thread:
+      type: array
+      items: { $ref: '#/components/schemas/SourceContextCommentSnapshot' }
+    anchor_comment_id: { type: string, format: uuid }
+    capture_token:
+      type: string
+      description: Opaque — encodes a content digest and the source issue id; not meant to be parsed by clients.
+    limits: { $ref: '#/components/schemas/SourceContextLimitUsage' }
+
+CreateCommentSubIssueRequest:
+  type: object
+  description: >-
+    `mode: manual` creates the sub-issue synchronously (`issue` body,
+    reusing `CreateIssueRequest`) and returns it immediately
+    (201 `IssueResponse`). `mode: agent` instead enqueues an agent
+    quick-create task that will itself capture the context
+    (`quick_create` body, reusing `QuickCreateIssueInput`) and returns
+    202 `QuickCreateIssueResponse`. `capture_token` must be the exact
+    value from the preceding `GET .../sub-issue-preview` call — a stale
+    token (the thread changed since, or it names a different source
+    issue) is rejected with 409 `source_context_changed` before either
+    mode runs.
+  required: [mode, capture_token]
+  properties:
+    mode:
+      type: string
+      enum: [manual, agent]
+    capture_token:
+      type: string
+    issue:
+      $ref: '#/components/schemas/CreateIssueRequest'
+    quick_create:
+      $ref: '#/components/schemas/QuickCreateIssueInput'

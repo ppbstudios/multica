@@ -16,7 +16,9 @@
 # daemon-auth ticket and are not documented here.
 #
 # Workspace gate (applies to every operation below, ahead of any
-# handler-specific logic): all 17 operations sit inside the
+# handler-specific logic): all 18 operations (17 from the original domain
+# pass + revoke-workspace-access, added by PPBM-3043 — found missing from
+# the original pass by PPBM-2960's router.go reconciliation) sit inside the
 # `middleware.RequireWorkspaceMember(queries)` group
 # (server/cmd/server/router.go ~line 1986), which runs BEFORE the handler:
 #   1. Resolves a workspace id from (in priority order) an `mat_` task
@@ -638,6 +640,106 @@
           runtime dependencies"`; `"failed to enumerate active agents"`;
           `"failed to unbind agents"` (non-drain teardown failure);
           `"failed to delete runtime"`; `"failed to commit transaction"`.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/runtimes/{runtimeId}/revoke-workspace-access:
+  post:
+    operationId: revokeRuntimeWorkspaceAccess
+    summary: Confirm making a public runtime private again, tearing down every non-owner dependent
+    description: >-
+      server/internal/handler/runtime.go:1039-1127
+      (`RevokeRuntimeWorkspaceAccess`). The confirmed counterpart to the
+      normal `PATCH /api/runtimes/{runtimeId}` visibility change: that
+      PATCH applies directly when no teammate depends on the runtime, and
+      otherwise returns a structured 409 plan
+      (`RuntimeAccessRevocationPlanResponse`, `runtime_has_nonowner_dependents`)
+      for the caller to review; this endpoint applies that reviewed plan
+      atomically. In one transaction: flips visibility to `private`,
+      cancels every non-owner active task
+      (`taskfailure.ReasonRuntimeAccessRevoked`), settles their chats,
+      unbinds every non-owner agent, and pauses autopilots bound to those
+      newly-unbound agents. Re-validates the confirmed agent/task id sets
+      against a fresh row-locked read before committing — a plan that went
+      stale between dialog-open and confirm is refused rather than acted
+      on blind. Server-side cancellation is authoritative even while the
+      runtime's daemon is offline; a disconnected machine simply cannot
+      claim new work once the transaction commits.
+    tags: [runtimes]
+    security: *runtimeAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: runtimeId
+        in: path
+        required: true
+        schema: { type: string }
+        description: Must be a parseable UUID.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/RevokeRuntimeWorkspaceAccessRequest' }
+    responses:
+      '200':
+        description: Made private; dependents torn down.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RuntimeWorkspaceAccessRevocationResponse' }
+      '400':
+        description: >-
+          `"invalid request body"`; `"expected_nonowner_agent_ids must be a
+          list of valid UUIDs"` / `"expected_task_ids must be a list of
+          valid UUIDs"` (an entry fails UUID parsing); `"invalid
+          runtime_id"`. Plus the file-level "Workspace gate" 400s.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidExpectedAgents: { value: { error: "expected_nonowner_agent_ids must be a list of valid UUIDs" } }
+              invalidExpectedTasks: { value: { error: "expected_task_ids must be a list of valid UUIDs" } }
+      '401':
+        description: See the file-level "Workspace gate" note.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '403':
+        description: '`"only the runtime owner can change its visibility"` — caller is not this runtime''s owner (no admin override, MUL-6126). Checked once before the transaction opens and again after the row lock, in case ownership changed in between.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only the runtime owner can change its visibility" }
+      '404':
+        description: '`"runtime not found"` — see the file-level note.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "runtime not found" }
+      '409':
+        description: >-
+          Already private (`runtime_access_revocation_not_required`); a
+          dependent row is transiently lock-contended
+          (`runtime_access_revocation_busy`, Postgres `55P03` — retry); or
+          the confirmed agent/task set no longer matches a fresh read
+          (`runtime_access_revocation_plan_changed`, carrying the current
+          plan so the dialog can re-render for a fresh confirmation).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/RuntimeAccessRevocationConflict'
+                - $ref: '#/components/schemas/RuntimeAccessRevocationPlanResponse'
+      '500':
+        description: >-
+          `"failed to start transaction"`; `"failed to lock runtime"`;
+          `"failed to lock runtime agents"`; `"failed to lock runtime
+          chats"`; `"failed to lock runtime tasks"`; `"failed to update
+          runtime"`; `"failed to cancel runtime tasks"`; `"failed to settle
+          runtime chats"`; `"failed to unbind runtime agents"`; `"failed to
+          pause affected autopilots"`; `"failed to commit runtime privacy
+          change"`.
         content:
           application/json:
             schema: { $ref: '#/components/schemas/Error' }

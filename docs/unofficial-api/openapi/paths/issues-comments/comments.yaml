@@ -1,6 +1,11 @@
 # Comment CRUD, resolution and reactions. Source:
 # server/internal/handler/comment.go, reaction.go (baseline revision
 # ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+#
+# /api/comments/{commentId}/sub-issue-preview and .../sub-issues (source:
+# source_context.go) were added by PPBM-3043 — missing from the original
+# domain pass, found by PPBM-2960's router.go reconciliation. Both are
+# human-actor-only (handler.RequireHumanActor).
 
 /api/issues/{id}/comments/trigger-preview:
   post:
@@ -248,6 +253,238 @@
           application/json:
             schema:
               $ref: '#/components/schemas/Error'
+
+/api/comments/{commentId}/sub-issue-preview:
+  get:
+    operationId: previewCommentSubIssue
+    summary: Preview the source context a sub-issue would capture from this comment's thread
+    description: >-
+      server/internal/handler/source_context.go:406-422
+      (`PreviewCommentSubIssue`). Human-actor-only
+      (`handler.RequireHumanActor`). Builds an immutable snapshot of the
+      comment's whole thread (from its root ancestor down through the
+      anchor comment, source issue included) without persisting anything,
+      and returns an opaque `capture_token` the create call must echo back
+      unchanged. Read-only; safe to call repeatedly (e.g. to refresh after
+      `source_context_changed`).
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentSubIssuePreviewResponse'
+      '400':
+        description: Invalid `workspace_id`/`comment_id`.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"this endpoint is only available to human actors" (also reflected in `security` above by the absence of `AgentTaskToken`/`CloudNodePAT`), or the caller is not a workspace member ("workspace not found").'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: >-
+          `anchor_comment_deleted` (the comment is gone or tombstoned —
+          NOT a 404, since the comment id itself was reachable via the
+          URL), `source_context_invalid_path` (the comment's ancestor
+          chain is malformed: not a comment type, cycle detected, broken
+          root linkage), or `source_issue_deleted`.
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [error, code]
+              properties:
+                error: { type: string }
+                code:
+                  type: string
+                  enum: [anchor_comment_deleted, source_context_invalid_path, source_issue_deleted]
+      '422':
+        description: '`source_context_too_large` — the thread exceeds the max-comments cap; `limits` carries the actual count.'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [error, code, limits]
+              properties:
+                error: { type: string }
+                code: { type: string, const: source_context_too_large }
+                limits: { $ref: '#/components/schemas/SourceContextLimitUsage' }
+
+/api/comments/{commentId}/sub-issues:
+  post:
+    operationId: createCommentSubIssue
+    summary: Create a sub-issue from a captured comment-thread context
+    description: >-
+      server/internal/handler/source_context.go:428-500
+      (`CreateCommentSubIssue`). Human-actor-only
+      (`handler.RequireHumanActor`). Requires a `capture_token` from the
+      immediately preceding `GET .../sub-issue-preview` call; re-validates
+      it against a fresh rebuild of the context (digest + source issue id)
+      before proceeding, so a thread that changed between preview and
+      submit is rejected rather than silently captured stale. On success,
+      clones the thread's attachments into the new context's own storage
+      objects (best-effort cleanup of the clones if the subsequent create
+      fails). `mode: manual` creates the issue synchronously; `mode: agent`
+      enqueues an agent quick-create task that performs the capture
+      itself — the agent-mode request's own `quick_create.parent_issue_id`
+      field, if sent, is silently ignored (the parent is always the
+      captured source issue).
+    tags: [comments]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: commentId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateCommentSubIssueRequest'
+    responses:
+      '201':
+        description: '`mode: manual` — sub-issue created synchronously.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueResponse'
+      '202':
+        description: '`mode: agent` — quick-create task enqueued; the sub-issue itself does not exist yet.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuickCreateIssueResponse'
+      '400':
+        description: >-
+          "invalid request body"; `mode` is not `manual`/`agent`; manual
+          mode missing `issue`/`issue.title`; agent mode missing
+          `quick_create`, with neither/both of `agent_id`/`squad_id`, an
+          invalid `priority`, or other `QuickCreateIssueInput` field
+          validation failures (see the quick-create endpoint for the full
+          catalog — same validation code path); invalid `workspace_id`/
+          `comment_id`/`assignee_id`/`project_id`/`attachment_ids`/
+          `label_ids`/dates.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '402':
+        description: Workspace issue-count limit reached (checked before cloning attachments, so a near-limit workspace never pays the clone cost for a request that will be refused).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueLimitReachedResponse'
+      '403':
+        description: >-
+          "this endpoint is only available to human actors"; caller not a
+          workspace member; assignee-pair permission check failed (manual
+          mode); or the caller is not permitted to invoke the target
+          agent/squad (agent mode).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"squad not found or archived"; "agent not found"; "project not found" (either mode).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: >-
+          `source_context_changed` (capture_token's digest no longer
+          matches a fresh rebuild, or names a different source issue —
+          this is also the response when the token itself fails to
+          parse); `anchor_comment_deleted`; `source_issue_deleted`;
+          `source_context_invalid_path`; `source_context_already_attached`;
+          `active_duplicate_issue` (manual mode, unless
+          `allow_duplicate: true` on the issue body).
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [error, code]
+              properties:
+                error: { type: string }
+                code:
+                  type: string
+                  enum:
+                    - source_context_changed
+                    - anchor_comment_deleted
+                    - source_issue_deleted
+                    - source_context_invalid_path
+                    - source_context_already_attached
+                    - active_duplicate_issue
+      '422':
+        description: >-
+          `source_context_too_large` (carries `limits`);
+          `source_context_quick_create_unsupported` (agent mode, selected
+          runtime lacks the source-context quick-create daemon
+          capability); `agent_unavailable` (agent mode, target not ready
+          to invoke); `daemon_version_unsupported` (agent mode, daemon/CLI
+          too old for `priority`/`due_date` on this flow).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [error, code, limits]
+                  properties:
+                    error: { type: string }
+                    code: { type: string, const: source_context_too_large }
+                    limits: { $ref: '#/components/schemas/SourceContextLimitUsage' }
+                - $ref: '#/components/schemas/AgentUnavailableResponse'
+                - $ref: '#/components/schemas/DaemonVersionUnsupportedResponse'
+                - type: object
+                  required: [error, code]
+                  properties:
+                    error: { type: string }
+                    code: { type: string, const: source_context_quick_create_unsupported }
+      '500':
+        description: '"failed to check issue capacity"; generic creation failure (manual mode); or any other unclassified internal error.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '502':
+        description: '`source_context_attachment_copy_failed` — cloning the thread''s attachments into the new context failed.'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [error, code]
+              properties:
+                error: { type: string }
+                code: { type: string, const: source_context_attachment_copy_failed }
 
 /api/comments/{commentId}:
   put:
