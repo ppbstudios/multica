@@ -393,6 +393,308 @@ LiveResponse:
       description: RFC3339; omitted only if startedAt was never set (construction-time only).
   additionalProperties: false
 
+SendCodeRequest:
+  type: object
+  description: server/internal/handler/auth.go:113-115 (`SendCodeRequest`). Backs POST /auth/send-code.
+  required: [email]
+  properties:
+    email:
+      type: string
+      format: email
+
+VerifyCodeRequest:
+  type: object
+  description: server/internal/handler/auth.go:117-120 (`VerifyCodeRequest`). Backs POST /auth/verify-code.
+  required: [email, code]
+  properties:
+    email:
+      type: string
+      format: email
+    code:
+      type: string
+      description: 6-digit code (generateCode, auth.go ~line 122); a dev-only override bypasses this check off production (isDevVerificationCode).
+
+GoogleLoginRequest:
+  type: object
+  description: server/internal/handler/auth.go:513-516 (`GoogleLoginRequest`). Backs POST /auth/google.
+  required: [code]
+  properties:
+    code:
+      type: string
+      description: OAuth authorization code from Google's redirect.
+    redirect_uri:
+      type: string
+      description: >-
+        Falls back to the server's GOOGLE_REDIRECT_URI env var when omitted
+        or empty (auth.go ~line 575-578); must match whatever redirect URI
+        Google issued the code against or the token exchange fails.
+
+LoginResponse:
+  type: object
+  description: >-
+    server/internal/handler/auth.go:108-111 (`LoginResponse`). Returned by
+    POST /auth/verify-code and POST /auth/google on success, alongside the
+    HttpOnly auth + CSRF cookies set on the response (and CloudFront signed
+    cookies when configured).
+  required: [token, user]
+  properties:
+    token:
+      type: string
+      description: Signed session JWT, the same value set in the HttpOnly auth cookie.
+    user:
+      $ref: '#/components/schemas/UserResponse'
+
+# ---------------------------------------------------------------------------
+# /api/plugin-bridge/v1/* — browser-session relay for the Plugin Action API.
+# These mirror server/pkg/publicapi/v1/types.go field-for-field (same Go
+# types, same handler functions as the official /v1 contract in
+# server/pkg/publicapi/v1/openapi.yaml, which is out of this ticket's scope)
+# but are named Plugin* here to avoid colliding with this document's own
+# Issue/Comment schema names, which describe the full App API shapes.
+# ---------------------------------------------------------------------------
+
+PluginContext:
+  type: object
+  description: >-
+    server/pkg/publicapi/v1/types.go:5-12 (`Context`), built by
+    GetPluginContext (server/internal/handler/plugin_action.go ~line 269).
+  required: [workspace, config, granted_net_domains, actor]
+  properties:
+    workspace:
+      $ref: '#/components/schemas/PluginContextWorkspace'
+    user:
+      allOf: [{ $ref: '#/components/schemas/PluginContextUser' }]
+      description: Omitted when the caller acts as the Plugin installation itself (no member behind the call).
+    issue:
+      allOf: [{ $ref: '#/components/schemas/PluginContextIssue' }]
+      description: Present only when the request's `issue_id` query parameter names an issue the caller can reach.
+    config:
+      type: object
+      additionalProperties: true
+    granted_net_domains:
+      type: array
+      items: { type: string }
+    actor:
+      type: string
+      enum: [member, plugin]
+
+PluginContextWorkspace:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:14-18.
+  required: [id, name, slug]
+  properties:
+    id: { type: string }
+    name: { type: string }
+    slug: { type: string }
+
+PluginContextUser:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:20-23.
+  required: [id, name]
+  properties:
+    id: { type: string }
+    name: { type: string }
+
+PluginContextIssue:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:25-29.
+  required: [id, identifier, title]
+  properties:
+    id: { type: string }
+    identifier: { type: string }
+    title: { type: string }
+
+PluginIssue:
+  type: object
+  description: >-
+    server/pkg/publicapi/v1/types.go:34-60 (`Issue`). Returned by GET/PATCH
+    /api/plugin-bridge/v1/issues/{issue_ref}
+    (server/internal/handler/plugin_action.go, pluginIssuePayload ~line
+    447) — an explicit, independently-maintained subset of the App API's
+    full issue shape, not a reuse of it.
+  required:
+    - id
+    - workspace_id
+    - number
+    - identifier
+    - title
+    - description
+    - status
+    - priority
+    - assignee_type
+    - assignee_id
+    - creator_type
+    - creator_id
+    - parent_issue_id
+    - project_id
+    - position
+    - stage
+    - start_date
+    - due_date
+    - created_at
+    - updated_at
+    - revision
+    - last_activity_at
+    - metadata
+    - properties
+  properties:
+    id: { type: string }
+    workspace_id: { type: string }
+    number: { type: integer, format: int32 }
+    identifier: { type: string }
+    title: { type: string }
+    description: { type: [string, "null"] }
+    status: { type: string }
+    status_category: { type: string }
+    priority: { type: string }
+    assignee_type: { type: [string, "null"] }
+    assignee_id: { type: [string, "null"] }
+    creator_type: { type: string }
+    creator_id: { type: string }
+    parent_issue_id: { type: [string, "null"] }
+    project_id: { type: [string, "null"] }
+    position: { type: number }
+    stage: { type: [integer, "null"], format: int32 }
+    start_date: { type: [string, "null"], format: date }
+    due_date: { type: [string, "null"], format: date }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+    revision: { type: integer, format: int64, minimum: 1 }
+    last_activity_at: { type: [string, "null"], format: date-time }
+    metadata: { type: object, additionalProperties: true }
+    properties: { type: object, additionalProperties: true }
+
+PluginPatchIssueRequest:
+  type: object
+  description: >-
+    server/pkg/publicapi/v1/types.go:62-66 (`PatchIssueRequest`). Title
+    and/or description only — PatchPluginIssue (plugin_action.go ~line
+    350) refuses an empty body and rejects an empty title string.
+  properties:
+    expected_revision: { type: integer, format: int64, minimum: 1 }
+    title: { type: string }
+    description: { type: string }
+  anyOf:
+    - required: [title]
+    - required: [description]
+
+PluginComment:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:68-79 (`Comment`).
+  required: [id, author_type, author_id, content, type, created_at]
+  properties:
+    id: { type: string }
+    author_type: { type: string, enum: [member, agent, plugin] }
+    author_id: { type: string }
+    content: { type: string }
+    type: { type: string }
+    parent_id: { type: string }
+    created_at: { type: string, format: date-time }
+    deleted_at:
+      type: string
+      format: date-time
+      description: Set only on a deleted comment kept as an empty placeholder because it still has replies.
+
+PluginCommentListResponse:
+  type: object
+  description: >-
+    server/pkg/publicapi/v1/types.go:81-83. Newest 200 comments, in
+    chronological order (ListPluginComments, plugin_action.go ~line 483,
+    maxPluginCommentsPerRead).
+  required: [comments]
+  properties:
+    comments:
+      type: array
+      items:
+        $ref: '#/components/schemas/PluginComment'
+
+PluginCreateCommentRequest:
+  type: object
+  description: >-
+    server/pkg/publicapi/v1/types.go:85-88. CreatePluginComment
+    (plugin_action.go ~line 534) does not run @mention dispatch, unlike
+    the ordinary comment-create endpoint.
+  required: [content]
+  properties:
+    content: { type: string, maxLength: 65536 }
+    parent_id: { type: string }
+
+PluginStorageKey:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:90-94.
+  required: [key, size_bytes, updated_at]
+  properties:
+    key: { type: string }
+    size_bytes: { type: integer, format: int64 }
+    updated_at: { type: string, format: date-time }
+
+PluginStorageKeyListResponse:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:96-98.
+  required: [keys]
+  properties:
+    keys:
+      type: array
+      items:
+        $ref: '#/components/schemas/PluginStorageKey'
+
+PluginStorageValueResponse:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:100-102.
+  required: [value]
+  properties:
+    value: { type: string }
+
+PluginPutStorageValueRequest:
+  type: object
+  description: server/pkg/publicapi/v1/types.go:104-106.
+  required: [value]
+  properties:
+    value: { type: string, maxLength: 102400 }
+
+PluginProblem:
+  type: object
+  description: >-
+    server/pkg/publicapi/v1/problem.go (`Problem`, `WriteProblem`,
+    `ProblemContentType`). Every error from an `/api/plugin-bridge/v1/*`
+    operation uses this RFC 9457-flavored envelope rather than this
+    document's plain `Error`/`ErrorCode` shapes — served as
+    `application/problem+json`, not `application/json`. `error` is a
+    compatibility alias for `detail` for existing Plugin clients; new
+    callers should branch on `code`.
+  required: [type, title, status, code, detail, request_id, error]
+  properties:
+    type: { type: string, format: uri }
+    title: { type: string }
+    status: { type: integer }
+    code:
+      type: string
+      description: >-
+        Stable machine code. CodeForStatus (problem.go) maps a bare HTTP
+        status to one of invalid_request / unauthorized / payment_required
+        / forbidden / not_found / conflict / incompatible / rate_limited /
+        quota_exceeded / service_unavailable / upstream_unavailable /
+        internal_error; several call sites in
+        server/internal/handler/plugin_action.go pass a more specific code
+        instead (e.g. missing_scope, member_required, plugin_api_disabled,
+        revision_conflict) — see each operation's 4xx response below for
+        the codes it can actually produce.
+    detail: { type: string }
+    request_id: { type: string }
+    error:
+      type: string
+      deprecated: true
+      description: Compatibility alias for detail.
+    errors:
+      type: array
+      items:
+        type: object
+        required: [field, code, message]
+        properties:
+          field: { type: string }
+          code: { type: string }
+          message: { type: string }
+
 ReadinessResponse:
   type: object
   description: >-

@@ -105,6 +105,28 @@ IfMatchHeader:
   schema:
     type: string
 
+PluginInstallationHeader:
+  name: X-Multica-Plugin-Installation
+  in: header
+  required: true
+  description: >-
+    Identifies which Plugin installation a browser-session call to
+    `/api/plugin-bridge/v1/*` acts through; set by the host page, never by
+    the sandboxed surface iframe itself (server/internal/handler/
+    plugin_action.go, pluginInstallationHeader const and
+    pluginSessionCaller, ~line 44, ~line 124-151). The workspace is derived
+    from the installation this header names, not trusted from any other
+    client input. Technically only enforced on the session-caller path (an
+    `mpi_`/`mpc_` bearer caller resolves its installation from the token
+    instead), but that is the only path this header's group
+    (middleware.Auth, not middleware.PluginBearerOnly) can reach in
+    practice — see securitySchemes.yaml's CloudNodePAT deviation note.
+    Missing it fails AuthorizePluginAction with 400 "plugin installation is
+    required" (server/internal/service/plugin_action.go ~line 47).
+  schema:
+    type: string
+    format: uuid
+
 XRequestIDHeader:
   name: X-Request-ID
   in: header
