@@ -783,6 +783,154 @@ ConnectVCSRequest:
     access_token: {type: string}
 
 # ---------------------------------------------------------------------------
+# Qoder Cloud Agent (QCA) — qoder_connection.go, qoder_catalog.go,
+# qoder_disconnect.go. "qoder_cloud" is the stored provider value; `QCA` in
+# descriptions below is this ticket's shorthand for it, matching the
+# handlers' own error-message wording.
+# ---------------------------------------------------------------------------
+
+QoderConnectionResponse:
+  type: object
+  description: >-
+    qoder_connection.go:53-68 (`qoderSettingsView`). Returned by GET
+    /qoder, and by PUT/DELETE/stop/resume on success (each ends by calling
+    GetQoderConnection to re-serialize current state). When `available` is
+    false (no MULTICA_VCS_SECRET_KEY configured on this deployment) every
+    other field is its zero value and `configured` is false — the response
+    short-circuits before reading any stored connection.
+  required: [configured, available, name, base_url, environment_id, has_token, repositories, enabled, status, last_error, max_concurrency, run_timeout_minutes, active_runs, queued_runs]
+  properties:
+    configured: {type: boolean, description: "A connection row exists for this workspace."}
+    available: {type: boolean, description: "False when this server has no MULTICA_VCS_SECRET_KEY — QCA cannot be configured at all."}
+    name: {type: string}
+    base_url: {type: string, format: uri}
+    environment_id: {type: string}
+    has_token: {type: boolean, description: "Whether a Qoder API token is stored; the token itself is never returned."}
+    repositories:
+      type: array
+      items: {type: string}
+      description: "GitHub repository keys (qoderruntime.RepositoryKey form) with a bound per-repo token, sorted."
+    enabled: {type: boolean}
+    status: {type: string, description: "starting | online | offline | stopped | error. `online` is downgraded to `offline` in this response when no agent_runtime row has reported in the last 45s, even though the stored column still says online."}
+    last_error: {type: string}
+    max_concurrency: {type: integer, description: "Defaults to 3 (defaultQoderConcurrency) when unset."}
+    run_timeout_minutes: {type: integer, description: "Defaults to 60 (defaultQoderRunTimeout) when unset; stored max is 240 (maxQoderRunTimeout)."}
+    active_runs: {type: integer, description: "Tasks in dispatched/running state on this workspace's qoder_cloud runtime."}
+    queued_runs: {type: integer, description: "Tasks in queued state on this workspace's qoder_cloud runtime."}
+
+SaveQoderConnectionRequest:
+  type: object
+  description: >-
+    qoder_connection.go:128-212 (`qoderInput`, the shared decode+validate
+    path for PUT /qoder, POST /qoder/check, and POST /qoder/resume — same
+    request shape for all three). `base_url` must be one of two
+    allow-listed Qoder public API hosts (api.qoder.com /
+    api.qoder.com.cn) — anything else is rejected before any network call,
+    to prevent SSRF via a connection pointed at an internal address.
+    `qoder_token` is required unless a token is already stored for this
+    workspace (then it may be omitted to keep the existing one).
+    `github_tokens` is a partial map: a key with an empty token value
+    reuses the currently-stored token for that repository instead of
+    clearing it. Unknown top-level fields, or more than one JSON value in
+    the body, are both rejected (400).
+  required: [name, base_url, environment_id]
+  properties:
+    name: {type: string}
+    base_url: {type: string, format: uri, enum: ["https://api.qoder.com/api/v1/cloud", "https://api.qoder.com.cn/api/v1/cloud"]}
+    environment_id: {type: string}
+    qoder_token: {type: string, description: "Required on first connect. Rejected if it contains whitespace/CR/LF."}
+    github_tokens:
+      type: object
+      additionalProperties: {type: string}
+      description: >-
+        Map of GitHub repository (normalized by qoderruntime.RepositoryKey,
+        source accepts a full GitHub URL) to a per-repository access token.
+        An empty-string value for an existing key keeps that repo's stored
+        token unchanged; a duplicate normalized key in the same request is
+        a 400.
+    max_concurrency: {type: integer, minimum: 1, maximum: 10, description: "1..10 (qoderruntime.MaxConcurrencyLimit)."}
+    run_timeout_minutes: {type: integer, minimum: 5, maximum: 240}
+
+CheckQoderConnectionResponse:
+  type: object
+  description: >-
+    qoder_connection.go:214-252 (`CheckQoderConnection`). Validates the
+    submitted config (same body as SaveQoderConnectionRequest) by calling
+    GET {base_url}/environments/{environment_id} with the given token and
+    comparing the returned `id` to `environment_id` — nothing is persisted
+    by this endpoint.
+  required: [ok]
+  properties:
+    ok: {type: boolean, enum: [true], description: "Always true on 200; any mismatch or failure answers a non-2xx status instead."}
+
+ListQoderCatalogRequest:
+  type: object
+  description: >-
+    qoder_catalog.go:143-197 (`ListQoderEnvironments`'s decoded body). Both
+    fields are optional and fall back to the workspace's stored QCA
+    configuration when omitted — lets the UI probe environments before a
+    connection is fully saved, or reuse the stored token/URL afterward.
+    Unknown top-level fields, or more than one JSON value in the body, are
+    rejected (400).
+  properties:
+    qoder_token: {type: string, description: "Falls back to the stored token when omitted."}
+    base_url: {type: string, format: uri, description: "Falls back to the stored base_url, then to the default public API host, when omitted. Same two-host allow-list as SaveQoderConnectionRequest.base_url."}
+
+QoderCatalogItemResponse:
+  type: object
+  description: >-
+    qoder_catalog.go:36-39 (`qoderCatalogItem`). Only id/name cross the
+    server boundary — fetchQoderCatalog explicitly drops every other
+    upstream field (provider configurations may contain secrets) and
+    silently skips archived/duplicate entries while paginating.
+  required: [id, name]
+  properties:
+    id: {type: string, description: "Prefixed `agent_...` (ListQoderAgents) or `env_...` (ListQoderEnvironments); a response whose items fail that prefix check is itself rejected as a 502 upstream error, never forwarded."}
+    name: {type: string, description: "Falls back to `id` when the upstream name is blank."}
+
+QoderCatalogListResponse:
+  type: object
+  description: qoder_catalog.go:140, :196 — identical `{items: [...]}` envelope shared by ListQoderAgents and ListQoderEnvironments.
+  required: [items]
+  properties:
+    items:
+      type: array
+      items: {$ref: '#/components/schemas/QoderCatalogItemResponse'}
+
+DisconnectQoderConnectionRequest:
+  type: object
+  description: >-
+    qoder_disconnect.go:19-23 (`disconnectQoderRequest`). An empty/omitted
+    body is a valid plan ("I confirmed there are no active agents on
+    Qoder") — same semantics as UnbindAgentsAndDeleteRuntimeRequest for the
+    generic runtime delete flow. Any entry that is not a parseable UUID
+    fails the whole request with 400.
+  properties:
+    expected_active_agent_ids:
+      type: array
+      items: {type: string, format: uuid}
+      description: The active-agent snapshot shown in the confirmation dialog, compared against the live set inside the transaction.
+
+QoderDisconnectPlanChangedResponse:
+  type: object
+  description: >-
+    qoder_disconnect.go:202-208 (`checkQoderDisconnectPlan`). Built from
+    the same `runtimeHasActiveAgentsResponse` helper as the generic runtime
+    cascade-delete 409 (see RuntimeHasActiveAgentsResponse in
+    runtimes.yaml), but both `error` and `code` are overwritten with
+    Qoder-specific wording afterward — NOT the same enum values as that
+    schema, so modeled separately rather than reused.
+  required: [error, code, active_agents]
+  properties:
+    error: {type: string, enum: ["the agents on Qoder changed; please review and confirm again."]}
+    code: {type: string, enum: [runtime_delete_plan_changed]}
+    active_agents:
+      type: array
+      items:
+        description: Cross-domain reference (agents domain schema, not defined in this file).
+        $ref: '#/components/schemas/AgentResponse'
+
+# ---------------------------------------------------------------------------
 # Lark (lark.go)
 # ---------------------------------------------------------------------------
 

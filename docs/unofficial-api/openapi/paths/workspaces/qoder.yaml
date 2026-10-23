@@ -1,0 +1,435 @@
+# Domain: Qoder Cloud Agent (QCA) connection — "qoder_cloud" provider.
+# Source: server/internal/handler/qoder_connection.go, qoder_catalog.go,
+# qoder_disconnect.go, router.go:1722-1723 (member-level) and
+# router.go:1809-1814 (admin-level, inside the same r.Group as GitHub
+# connect / VCS connect in workspaces/github-vcs.yaml).
+#
+# Path-list correction (not silently reproduced): the originating ticket
+# listed "GET /qoder/check" and "GET /qoder/environments". router.go
+# registers both as POST, not GET — POST /qoder/check and POST
+# /qoder/environments — confirmed at router.go:1810-1811. Documented below
+# under their real methods.
+
+/api/workspaces/{id}/qoder:
+  get:
+    operationId: getQoderConnection
+    summary: Get the workspace's Qoder Cloud Agent (QCA) connection state
+    description: >-
+      qoder_connection.go:86-126 (`GetQoderConnection`). Member-visible
+      (router.go:1722, `RequireWorkspaceMemberFromURL`). `status` is
+      downgraded from the stored `online` to `offline` in the response
+      (not persisted) when no `agent_runtime` row for this workspace's
+      qoder_cloud provider has reported `last_seen_at` within the last 45
+      seconds.
+    tags: [Workspaces, Qoder]
+    security: &auth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters: &idParam
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '200':
+        description: >-
+          OK. Also the zero-value shape (`available: false` when this
+          server has no MULTICA_VCS_SECRET_KEY, or `configured: false` when
+          `available` is true but no connection row exists yet).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QoderConnectionResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: Decrypting the stored configuration failed, or another read error.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "cannot read QCA configuration"}
+  put:
+    operationId: saveQoderConnection
+    summary: Create or update the workspace's QCA connection
+    description: >-
+      qoder_connection.go:256-258, :264-363 (`SaveQoderConnection` ->
+      `saveQoderConnection(resume=false)`). Requires `owner` or `admin`
+      (router.go:1809, same role-gated group as GitHub connect / VCS
+      connect). Upsert — works whether or not a connection already exists.
+      Leaves `enabled` unchanged on an existing connection (only
+      POST .../resume or the very first save turns it on); always rotates
+      the connection's service credential (daemon token) and bumps
+      `revision`, which restarts the managed bridge supervisor loop for
+      this workspace. Refuses while a prior execution journal still has an
+      in-flight run/cleanup, or while a qoder_cloud task is
+      running/dispatched.
+    tags: [Workspaces, Qoder]
+    security: *auth
+    parameters: *idParam
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/SaveQoderConnectionRequest'}
+    responses:
+      '200':
+        description: Saved. Full current state (same shape as GET).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QoderConnectionResponse'}
+      '400':
+        description: >-
+          Invalid workspace id; invalid/unparseable body or more than one
+          JSON value in it; `name`/`environment_id` blank or `base_url` not
+          one of the two allow-listed Qoder hosts; `max_concurrency` or
+          `run_timeout_minutes` out of range; `qoder_token` missing or
+          contains whitespace; a `github_tokens` key is not a valid GitHub
+          repository reference, is duplicated after normalization, or its
+          token is blank/contains whitespace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              required: {value: {error: "name, environment and official API URL are required"}}
+              concurrency: {value: {error: "concurrency must be between 1 and 10"}}
+              timeout: {value: {error: "run timeout must be between 5 and 240 minutes"}}
+              token: {value: {error: "QCA token is required"}}
+              repoUrl: {value: {error: "invalid GitHub repository URL"}}
+              dupeRepo: {value: {error: "duplicate repository binding"}}
+              repoToken: {value: {error: "GitHub token is required for each repository"}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: >-
+          The connection is mid-synchronization (`busy_until` in the
+          future); a prior execution journal still has an in-flight
+          run/cleanup pending; or a qoder_cloud task is currently
+          running/dispatched.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              busy: {value: {error: "QCA is synchronizing; retry shortly"}}
+              journal: {value: {error: "wait for QCA execution cleanup before changing configuration"}}
+              active: {value: {error: "wait for active QCA tasks to finish before changing configuration"}}
+      '500':
+        description: Lock/read/encrypt/credential-mint/save step failed, or this server has no MULTICA_VCS_SECRET_KEY configured.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+  delete:
+    operationId: disconnectQoderConnection
+    summary: Permanently disconnect the workspace's QCA connection
+    description: >-
+      qoder_disconnect.go:34-118 (`DisconnectQoderConnection`). Requires
+      `owner` or `admin`. Unlike POST .../stop, this removes the encrypted
+      configuration for good and tears down every qoder_cloud
+      `agent_runtime` row (cancelling non-terminal tasks); agents
+      previously bound to that runtime are unbound but kept, with history
+      intact. Answers 200 with the connection's now-empty state (NOT 204 —
+      it ends by calling GetQoderConnection, same as PUT/stop/resume)
+      rather than 204 like DELETE .../vcs/connections/{connectionId}. The
+      optional body is a confirmation snapshot: if the live set of active
+      agents on Qoder's runtime(s) differs from `expected_active_agent_ids`,
+      the request is refused with the current set so the caller can
+      re-confirm (`runtime_delete_plan_changed`), the same pattern as the
+      generic runtime cascade-delete endpoint.
+    tags: [Workspaces, Qoder]
+    security: *auth
+    parameters: *idParam
+    requestBody:
+      required: false
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/DisconnectQoderConnectionRequest'}
+    responses:
+      '200':
+        description: Disconnected. Full current (now-disconnected) state.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QoderConnectionResponse'}
+      '400':
+        description: Invalid workspace id, unparseable request body, or `expected_active_agent_ids` contains a non-UUID entry.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              body: {value: {error: "invalid request body"}}
+              ids: {value: {error: "expected_active_agent_ids must be a list of valid UUIDs"}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '404':
+        description: No QCA connection exists for this workspace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "Qoder is not connected"}
+      '409':
+        description: >-
+          The connection is mid-synchronization; a qoder_cloud task is
+          running/dispatched; the active-agent set changed since the
+          caller's confirmation snapshot (structured body, distinct from
+          the other 409s here); or teardown/deletion could not complete yet
+          and should be retried (includes the not-yet-drained runtime case
+          and the two-phase stop-then-delete race window).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/QoderDisconnectPlanChangedResponse'
+      '500':
+        description: Lock/load/revoke/teardown/delete step failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "cannot disconnect Qoder"}
+
+/api/workspaces/{id}/qoder/agents:
+  get:
+    operationId: listQoderAgents
+    summary: List the connected Qoder Cloud account's agents
+    description: >-
+      qoder_catalog.go:110-141 (`ListQoderAgents`). Member-visible
+      (router.go:1723). Proxies Qoder's own paginated `/agents` catalog
+      (up to 10 pages of 100), dropping archived/duplicate entries and
+      every field except id/name — provider configurations under this id
+      may contain secrets that must not leave the server.
+    tags: [Workspaces, Qoder]
+    security: *auth
+    parameters: *idParam
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QoderCatalogListResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: No QCA connection configured yet for this workspace, or its stored `base_url` is no longer on the allow-list.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              notConfigured: {value: {error: "configure a QCA connection first"}}
+              badUrl: {value: {error: "unsupported QCA API URL"}}
+      '429':
+        description: Catalog request rate limit reached for this workspace (shared with .../environments). `Retry-After: 60` header set.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        headers:
+          Retry-After: {schema: {type: string, enum: ['60']}}
+      '500':
+        description: Reading the stored configuration failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "cannot read QCA configuration"}
+      '502':
+        description: >-
+          Reaching Qoder failed, Qoder answered a non-200, or the response
+          was malformed / paginated past the 10-page safety limit / an
+          item's id did not carry the expected `agent_` prefix.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/qoder/check:
+  post:
+    operationId: checkQoderConnection
+    summary: Validate a QCA configuration against the live Qoder API, without saving it
+    description: >-
+      qoder_connection.go:214-252 (`CheckQoderConnection`). Requires
+      `owner` or `admin`. Same request body and validation as PUT
+      /qoder (`qoderInput`); additionally calls `GET
+      {base_url}/environments/{environment_id}` with the submitted token
+      and confirms the returned resource's `id` matches. Nothing is
+      persisted.
+    tags: [Workspaces, Qoder]
+    security: *auth
+    parameters: *idParam
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/SaveQoderConnectionRequest'}
+    responses:
+      '200':
+        description: The environment check passed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CheckQoderConnectionResponse'}
+      '400':
+        description: >-
+          Same body-validation causes as PUT /qoder (see its 400
+          examples), plus Qoder answering a non-200 status for the
+          environment lookup.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "QCA access check returned HTTP 404"}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '500':
+        description: This server has no MULTICA_VCS_SECRET_KEY configured.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '502':
+        description: Reaching Qoder failed, or the environment lookup response was malformed or returned a mismatched id.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              unreachable: {value: {error: "QCA connection failed"}}
+              mismatch: {value: {error: "invalid QCA resource response"}}
+
+/api/workspaces/{id}/qoder/environments:
+  post:
+    operationId: listQoderEnvironments
+    summary: List environments visible to a Qoder token/API host
+    description: >-
+      qoder_catalog.go:143-197 (`ListQoderEnvironments`). Requires `owner`
+      or `admin`. Unlike the other QCA write endpoints, POST is used here
+      for a read — `qoder_token`/`base_url` are optional overrides (fall
+      back to the stored configuration), letting the UI preview
+      environments before or after a connection is saved. Same catalog
+      fetch/pagination/field-stripping behavior as GET .../qoder/agents.
+    tags: [Workspaces, Qoder]
+    security: *auth
+    parameters: *idParam
+    requestBody:
+      required: false
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ListQoderCatalogRequest'}
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QoderCatalogListResponse'}
+      '400':
+        description: >-
+          Invalid workspace id; unparseable body or more than one JSON
+          value in it; resolved `base_url` not on the allow-list; or no
+          token available (neither submitted nor previously stored) or it
+          contains whitespace.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              badUrl: {value: {error: "unsupported QCA API URL"}}
+              noToken: {value: {error: "QCA token is required"}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '429':
+        description: Catalog request rate limit reached for this workspace (shared with GET .../agents). `Retry-After: 60` header set.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        headers:
+          Retry-After: {schema: {type: string, enum: ['60']}}
+      '500':
+        description: Reading the stored configuration failed (only when no override was submitted).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '502':
+        description: Reaching Qoder failed, Qoder answered a non-200, or the response was malformed / paginated past the safety limit / an item's id lacked the `env_` prefix.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+
+/api/workspaces/{id}/qoder/stop:
+  post:
+    operationId: stopQoderConnection
+    summary: Pause the QCA connection without discarding its secrets
+    description: >-
+      qoder_connection.go:531-582 (`StopQoderConnection`). Requires `owner`
+      or `admin`. Sets `enabled: false` and revokes the bridge's service
+      credential; configuration (token, environment, repo bindings) is kept
+      so a later POST .../resume can restart with it unchanged. Active
+      tasks must be cancelled through the task API first — this endpoint
+      does not cancel them itself. Calling it when no connection exists is
+      a silent no-op that still answers 200 with the (zero-value)
+      connection state, because the underlying checks and updates all
+      affect zero rows without erroring.
+    tags: [Workspaces, Qoder]
+    security: *auth
+    parameters: *idParam
+    responses:
+      '200':
+        description: Stopped. Full current state.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QoderConnectionResponse'}
+      '400':
+        description: Invalid workspace id.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: The connection is mid-synchronization, or a qoder_cloud task is currently running/dispatched.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            examples:
+              busy: {value: {error: "QCA is synchronizing; retry shortly"}}
+              active: {value: {error: "wait for or cancel active QCA tasks before stopping"}}
+      '500':
+        description: Lock/check/revoke/update step failed.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+            example: {error: "cannot stop QCA runtime"}
+
+/api/workspaces/{id}/qoder/resume:
+  post:
+    operationId: resumeQoderConnection
+    summary: Resume a paused QCA connection, or connect and enable it in one call
+    description: >-
+      qoder_connection.go:260-262, :264-363 (`ResumeQoderConnection` ->
+      `saveQoderConnection(resume=true)`). Requires `owner` or `admin`.
+      Identical request/validation/upsert behavior to PUT /qoder, with one
+      difference: `enabled` is forced to true regardless of its prior
+      value, which is what distinguishes "resume" from a plain save that
+      leaves a paused connection paused.
+    tags: [Workspaces, Qoder]
+    security: *auth
+    parameters: *idParam
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/SaveQoderConnectionRequest'}
+    responses:
+      '200':
+        description: Resumed. Full current state.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QoderConnectionResponse'}
+      '400':
+        description: Same body-validation causes as PUT /qoder (see its 400 examples).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '403':
+        description: Caller is not owner/admin.
+        content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      '409':
+        description: Same conflict causes as PUT /qoder (busy / pending execution journal / active tasks).
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
+      '500':
+        description: Lock/read/encrypt/credential-mint/save step failed, or this server has no MULTICA_VCS_SECRET_KEY configured.
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Error'}
