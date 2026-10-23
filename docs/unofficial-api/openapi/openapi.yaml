@@ -65,6 +65,11 @@ tags:
     description: Per-member notification inbox (list/read/archive).
   - name: NotificationPreferences
     description: Per-member notification delivery preferences.
+  - name: Issue Workflows
+    description: >-
+      Per-workspace project workflow definitions (MUL-7420) — ordered status
+      steps with per-step handoffs — and the per-column handoff settings and
+      handoff-brief preview that go with them.
 paths: {}
 components:
   securitySchemes: {}
