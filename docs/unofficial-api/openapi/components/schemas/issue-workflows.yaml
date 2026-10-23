@@ -1,0 +1,328 @@
+# Domain: issue-workflows (7 endpoints, PPBM-3040 — Stage 4 of PPBM-2950).
+# Source: server/internal/handler/issue_workflow.go and
+# server/internal/issueworkflow/issueworkflow.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe). Discovered missing from the
+# original 447-endpoint baseline by PPBM-2960's router.go brace-depth audit
+# (the standard chi route group, not a chaining/helper-reuse pattern — this
+# domain was omitted from Stage 1's static-parse baseline list outright).
+
+IssueWorkflowHandler:
+  type: object
+  description: >-
+    Who an issue is handed to when it enters a workflow step.
+    issueworkflow.Handler (issueworkflow.go:159). `id` is set only for the
+    three concrete types; issueworkflow.NormalizeHandoff clears `id` for
+    none/project_lead/creator even if the caller sends one.
+  required: [type]
+  properties:
+    type:
+      type: string
+      enum: [none, agent, squad, member, project_lead, creator]
+      description: >-
+        squad is accepted by the wire format but rejected by
+        ValidateHandoff for every write in this domain ("hand off to an
+        agent, a member or the project lead", MUL-7420) — a squad routes
+        its own assignment, so handing off to one would compete with it.
+        It is listed here because it is a valid IssueWorkflowResponse value
+        in principle (the Handler type enum itself does not exclude it) even
+        though no write path in this domain can ever produce it.
+    id:
+      type: string
+      format: uuid
+      description: Set only when type is agent, squad or member.
+
+IssueWorkflowStep:
+  type: object
+  description: One status of a workflow with its handoff. IssueWorkflowStepPayload (issue_workflow.go:78).
+  required: [status_key, handler, instructions]
+  properties:
+    status_key:
+      type: string
+      description: A key from the workspace's issue_status catalog, or a built-in status key.
+    handler: { $ref: '#/components/schemas/IssueWorkflowHandler' }
+    instructions:
+      type: string
+      description: Brief instructions for whoever the step hands off to; empty when the step does not hand off.
+    next_status_key:
+      type: string
+      description: Where the handler moves the issue when done; omitted means "the next step on the board that is not blocked" (issueworkflow.Definition.NextStatus).
+    back_status_key:
+      type: string
+      description: Where the handler sends the issue back for changes; omitted means no back destination.
+
+IssueWorkflowResponse:
+  type: object
+  description: >-
+    IssueWorkflowResponse (issue_workflow.go:86). owner_id is null for the
+    workspace's Default workflow (issueworkflow.EnsureDefault creates it
+    with no owner); every other workflow's owner is the member who created
+    it. project_ids lists the projects currently using this exact workflow
+    row (computed per request by projectIDsByWorkflow — not stored on the
+    row), including, for Default, every project with no workflow_id or a
+    workflow_id pointing at a deleted row.
+  required:
+    - id
+    - workspace_id
+    - name
+    - description
+    - is_default
+    - owner_id
+    - steps
+    - project_ids
+    - created_at
+    - updated_at
+  properties:
+    id: { type: string, format: uuid }
+    workspace_id: { type: string, format: uuid }
+    name:
+      type: string
+      description: 1-64 characters; always the literal "Default" for the Default workflow (reserved, cannot be claimed by another workflow's name — case-insensitive).
+    description:
+      type: string
+      description: At most 256 characters.
+    is_default: { type: boolean }
+    owner_id:
+      type: string
+      format: uuid
+      nullable: true
+    steps:
+      type: array
+      items: { $ref: '#/components/schemas/IssueWorkflowStep' }
+      description: >-
+        In board order (issueworkflow.Arrange): backlog, todo first (when
+        listed); the workflow's own steps in the middle; blocked, done,
+        cancelled last (when listed). todo/done/cancelled are always
+        present (IsRequired) even if the write omitted them, each becoming
+        a handler:none step with no instructions when not explicitly
+        configured.
+    project_ids:
+      type: array
+      items: { type: string, format: uuid }
+    created_at: { type: string, format: date-time }
+    updated_at: { type: string, format: date-time }
+
+NewWorkflowStatus:
+  type: object
+  description: >-
+    Creates a workspace issue_status catalog row inline as part of a
+    workflow write, so a column can be added without visiting the status
+    settings screen first. NewWorkflowStatus (issue_workflow.go:304).
+    Requires isWorkspaceAdmin (owner/admin) to actually create a new row —
+    a non-admin naming a status that doesn't already exist (matched
+    case-insensitively by name) fails with status_create_forbidden; naming
+    one that does already exist reuses it without error regardless of role.
+  required: [name, category, color]
+  properties:
+    name:
+      type: string
+      description: 1-64 characters (trimmed). Reused by case-insensitive name match if a status of this name already exists in the workspace.
+    category:
+      type: string
+      description: 'One of: unstarted, started, done, closed (issuestatus.ParseCategory). An unrecognized value silently falls back to "started" rather than erroring.'
+    color:
+      type: string
+      description: >-
+        6-digit hex (e.g. "#3b82f6"); empty uses a category default
+        (unstarted #94a3b8, started #3b82f6, done #22c55e, closed #64748b).
+        An invalid non-empty value is a 400 ("color must be a 6-digit hex
+        value like #3b82f6").
+
+IssueWorkflowStepInput:
+  type: object
+  description: >-
+    One step of a write request. IssueWorkflowStepInput
+    (issue_workflow.go:313). Exactly one of status_key or new_status is
+    meaningful per step — when new_status is set, the created/reused
+    status's key is used and any status_key value sent alongside it is
+    ignored (resolveStepInputs overwrites step.StatusKey from the resolved
+    entry).
+  properties:
+    status_key:
+      type: string
+      description: An existing issue_status catalog key (workspace-defined or built-in). Required when new_status is not given.
+    new_status: { $ref: '#/components/schemas/NewWorkflowStatus' }
+    handler: { $ref: '#/components/schemas/IssueWorkflowHandler' }
+    instructions:
+      type: string
+      description: Dropped (forced empty) by NormalizeHandoff when handler.type is none or omitted. Maximum 8000 characters.
+    next_status_key:
+      type: string
+      description: Must name another status_key present elsewhere in the same steps array, once resolved; validated after new_status creation/resolution.
+    back_status_key:
+      type: string
+      description: Same constraint as next_status_key.
+
+IssueWorkflowWriteRequest:
+  type: object
+  description: >-
+    Body of POST /api/issue-workflows and PATCH /api/issue-workflows/{id}.
+    IssueWorkflowWriteRequest (issue_workflow.go:322). All fields optional;
+    an absent field keeps the current value on PATCH (name/description are
+    pointers so the server can tell "omitted" from "set to empty string" —
+    an explicit empty description is accepted, but an explicit empty name
+    fails validation same as omitting it entirely for a non-Default
+    workflow). On create, an omitted name/description is treated as "".
+  properties:
+    name:
+      type: string
+      nullable: true
+      description: Ignored on PATCH when the target is the Default workflow (its name is fixed).
+    description:
+      type: string
+      nullable: true
+    steps:
+      type: array
+      items: { $ref: '#/components/schemas/IssueWorkflowStepInput' }
+      nullable: true
+      description: >-
+        On PATCH, omitting this field entirely keeps the workflow's current
+        steps untouched; providing it (even as []) replaces the full step
+        list. Maximum 50 steps after the fixed statuses are arranged in.
+    status_mapping:
+      type: object
+      additionalProperties: { type: string }
+      description: >-
+        Required (and validated) only for a PATCH whose new steps would
+        drop a status issues of the workflow's projects still use. Maps
+        each such status_key to a destination status_key the new workflow
+        accepts. Unused on create (a new workflow has no projects/issues
+        yet).
+    dry_run:
+      type: boolean
+      description: >-
+        When true, computes and returns the status-remap plan without
+        writing anything (200, not 201/200-with-side-effects) — even when
+        the plan is empty (no projects affected).
+
+StatusMappingRequirement:
+  type: object
+  description: >-
+    One status some of the affected projects' issues are on that the
+    target workflow (or, for SetProjectWorkflow, the Default workflow) does
+    not accept. StatusMappingRequirement (issue_workflow.go:102).
+  required: [status_key, issue_count, suggested_status_key]
+  properties:
+    status_key: { type: string }
+    issue_count: { type: integer, format: int64 }
+    suggested_status_key:
+      type: string
+      description: Server's default choice (issueworkflow.MoveTarget) — same lifecycle-category status on the target workflow, or its start status.
+
+StatusIssueCount:
+  type: object
+  description: A status the target workflow already accepts, with its issue count — included for visibility, not blocking. StatusIssueCount (issue_workflow.go:110).
+  required: [status_key, issue_count]
+  properties:
+    status_key: { type: string }
+    issue_count: { type: integer, format: int64 }
+
+WorkflowMappingPlan:
+  type: object
+  description: workflowMappingPlan (issue_workflow.go:115), returned by dry_run and embedded in the 409 workflow_status_mapping_required body.
+  required: [required, unchanged, total_issues, affected_issues]
+  properties:
+    required:
+      type: array
+      items: { $ref: '#/components/schemas/StatusMappingRequirement' }
+      description: Sorted by status_key.
+    unchanged:
+      type: array
+      items: { $ref: '#/components/schemas/StatusIssueCount' }
+    total_issues: { type: integer, format: int64 }
+    affected_issues: { type: integer, format: int64 }
+
+WorkflowStatusMappingRequiredResponse:
+  type: object
+  description: >-
+    409 response written by writeMappingRequired (issue_workflow.go:615)
+    from PATCH /api/issue-workflows/{id} when the edit would drop a status
+    some of the workflow's projects' issues are on and status_mapping does
+    not (yet) cover every one of them with a destination the new workflow
+    accepts. Not added to the shared ErrorCode enum — carries `plan`, which
+    that schema does not model — same precedent as IssueStatusInUseError in
+    issue-resources.yaml.
+  required: [error, code, plan]
+  properties:
+    error:
+      type: string
+      description: 'e.g. "choose a destination status for the 3 issue(s) on \"triage\"" or "destination status \"foo\" for \"triage\" is not part of the target workflow".'
+    code:
+      type: string
+      const: workflow_status_mapping_required
+    plan: { $ref: '#/components/schemas/WorkflowMappingPlan' }
+  additionalProperties: false
+
+WorkflowInUseError:
+  type: object
+  description: >-
+    409 response from DELETE /api/issue-workflows/{id} when one or more
+    projects still use the workflow (issue_workflow.go:866). Not added to
+    the shared ErrorCode enum for the same reason as
+    WorkflowStatusMappingRequiredResponse — carries project_count.
+  required: [error, code, project_count]
+  properties:
+    error:
+      type: string
+      description: 'e.g. "3 project(s) still use this workflow; switch them to another workflow first".'
+    code:
+      type: string
+      const: workflow_in_use
+    project_count: { type: integer }
+  additionalProperties: false
+
+SetIssueWorkflowHandoffRequest:
+  type: object
+  description: >-
+    Body of PUT /api/issue-workflows/{id}/handoffs/{status}.
+    SetIssueWorkflowHandoffRequest (issue_workflow.go:1080), embedding
+    IssueWorkflowStepPayload. The step's status_key comes from the
+    {status} path parameter, not from a status_key field in this body —
+    this endpoint's IssueWorkflowStepPayload.status_key is read nowhere in
+    SetIssueWorkflowHandoff; confirmed from source, not a gap.
+  required: [handler, instructions]
+  properties:
+    handler: { $ref: '#/components/schemas/IssueWorkflowHandler' }
+    instructions:
+      type: string
+      description: Dropped by NormalizeHandoff when handler.type is none.
+    next_status_key: { type: string }
+    back_status_key: { type: string }
+    copy_for_project_id:
+      type: string
+      format: uuid
+      description: >-
+        When set, leaves this workflow row untouched and instead creates a
+        copy of it (named "<workflow> (<project>)", numbered on collision)
+        with only this handoff changed, then switches the named project to
+        the copy — all in one transaction. The project must currently use
+        this exact workflow (409 invalid_handoff otherwise) and the caller
+        must be able to manage that project's workflow (owner/admin or the
+        project's lead); the Default workflow cannot be copied this way
+        (400 invalid_handoff).
+
+PreviewIssueWorkflowBriefRequest:
+  type: object
+  description: >-
+    Body of POST /api/issue-workflows/{id}/brief.
+    PreviewIssueWorkflowBriefRequest (issue_workflow.go:1274), embedding
+    IssueWorkflowStepPayload. Unlike the handoffs endpoint, status_key here
+    IS read directly from the body (there is no {status} path segment on
+    this route) and must already be one of the target workflow's steps.
+  required: [status_key, handler, instructions]
+  properties:
+    status_key:
+      type: string
+      description: Must name a step already on the target workflow (400 "status_key is not a column of this workflow" otherwise).
+    handler: { $ref: '#/components/schemas/IssueWorkflowHandler' }
+    instructions: { type: string }
+    next_status_key: { type: string }
+    back_status_key: { type: string }
+    project_id:
+      type: string
+      format: uuid
+      description: >-
+        Optional — names the project the preview is rendered for (its
+        title appears in the brief's heading). Silently ignored (not
+        validated, not an error) if it does not resolve to a project in
+        this workspace; the brief then omits the project name instead of
+        failing.

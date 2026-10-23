@@ -24,8 +24,18 @@ ErrorCode:
 
     The `code` enum below is every machine-readable code actually reaching
     the wire via writeErrorCode or writeFeatureDisabled in production
-    handlers as of the baseline revision — 50 distinct values. The
-    originating ticket described this set as "24종 한정"; that count
+    handlers as of the baseline revision — originally 50 distinct values,
+    plus 6 added by the issue-workflows domain (PPBM-3040):
+    invalid_handoff, invalid_workflow, project_workflows_disabled,
+    status_create_forbidden, workflow_is_default, workflow_name_taken — all
+    from server/internal/handler/issue_workflow.go's direct
+    writeErrorCode(...)/writeFeatureDisabled(...) call sites, same
+    bare-{error,code} shape as every other value here (the two codes this
+    domain also emits with extra fields, workflow_in_use and
+    workflow_status_mapping_required, are intentionally NOT added — see
+    components/schemas/issue-workflows.yaml, same precedent as
+    issue_status_in_use in issue-resources.yaml). The originating ticket
+    described this set as "24종 한정"; that count
     matches only the direct writeErrorCode(...) call sites with a literal
     string argument, and misses two other sources: (1) 17 further codes
     that reach the wire through the writeFeatureDisabled(...) wrapper,
@@ -98,6 +108,8 @@ ErrorCode:
         - github_repository_browsing_not_configured
         - google_account_no_email
         - google_login_not_configured
+        - invalid_handoff
+        - invalid_workflow
         - invitation_rate_limited
         - invitation_rate_limiter_unavailable
         - invocation_not_allowed
@@ -108,6 +120,7 @@ ErrorCode:
         - plugin_api_disabled
         - plugin_surfaces_misconfigured
         - plugin_surfaces_not_configured
+        - project_workflows_disabled
         - runtime_profile_has_active_agents
         - seat_capacity_full
         - seat_capacity_overcommitted
@@ -115,6 +128,7 @@ ErrorCode:
         - seat_capacity_unavailable
         - signup_prohibited
         - slack_not_configured
+        - status_create_forbidden
         - storage_not_configured
         - suggestions_not_available
         - task_supplement_not_retryable
@@ -132,6 +146,8 @@ ErrorCode:
         - wecom_install_failed
         - wecom_install_rejected
         - wecom_not_configured
+        - workflow_is_default
+        - workflow_name_taken
         - workspace_subscriptions_disabled
   additionalProperties: false
 

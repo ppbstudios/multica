@@ -1,0 +1,498 @@
+# Domain: issue-workflows (7 endpoints, PPBM-3040 — Stage 4 of PPBM-2950).
+# Source: server/internal/handler/issue_workflow.go,
+# server/internal/issueworkflow/issueworkflow.go (baseline revision
+# ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe).
+#
+# Router: server/cmd/server/router.go ~line 2149, inside the same
+# `r.Group(func(r chi.Router) { r.Use(middleware.RequireWorkspaceMember(queries)) ... })`
+# workspace-scoped group as paths/issue-resources.yaml (~line 2006) — see
+# that file's header for the full shared-middleware rationale. In short,
+# every operation below:
+#   - accepts the same 4 credentials (PersonalAccessToken / AgentTaskToken /
+#     CloudNodePAT / BrowserSession — components/securitySchemes.yaml);
+#   - requires X-Workspace-ID or X-Workspace-Slug plus a valid member, with
+#     the same four common failures NOT repeated per-operation below:
+#       400 "workspace_id is required" — neither header present
+#       400 "invalid workspace id" — X-Workspace-ID present but not a UUID
+#       401 "user not authenticated" — no resolvable user from the credential
+#       404 "workspace not found" — header resolved, but no membership row
+#         for this user in that workspace
+#
+# Feature gate: creating a workflow (POST /api/issue-workflows) always
+# requires the project_workflows_v1 flag (403 project_workflows_disabled);
+# setting a handoff (PUT .../handoffs/{status}) requires it only when the
+# handoff actually hands off (HandsOff()) or copies the workflow for one
+# project — a no-op/none handoff on an unflagged workspace still succeeds.
+# Reading (list/get) and PATCH are never gated by this flag — confirmed from
+# source: UpdateIssueWorkflow has no requireProjectWorkflowsV1 call at all,
+# matching the flag's own doc comment ("leaves workflows already in use
+# working"). Delete is likewise ungated.
+
+/api/issue-workflows:
+  get:
+    operationId: listIssueWorkflows
+    summary: List the workspace's project workflows
+    description: >-
+      server/internal/handler/issue_workflow.go:219-259
+      (`ListIssueWorkflows`). Any member. When project_workflows_v1 is
+      enabled, self-heals by storing the workspace's Default workflow row
+      on first read if it doesn't exist yet (issueworkflow.EnsureDefault) —
+      every subsequent list/get sees the same stored Default from then on.
+      When the flag is OFF and no workflow has ever been stored, this
+      returns an EMPTY workflows array (NOT a synthesized built-in Default
+      entry) — confirmed from source; issueworkflow.DefaultFor's synthesis
+      fallback is used elsewhere (status resolution) but not by this
+      handler.
+    tags: [Issue Workflows]
+    security: &workflowAuth
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - CloudNodePAT: []
+      - BrowserSession: []
+    parameters: &workflowHeaders
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workflows, total]
+              properties:
+                workflows:
+                  type: array
+                  items: { $ref: '#/components/schemas/IssueWorkflowResponse' }
+                total:
+                  type: integer
+                  description: len(workflows); a workflow whose stored steps fail to decode is silently skipped from both the array and this count, logged as a warning rather than failing the request.
+      '500':
+        description: '"failed to list workflows".'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  post:
+    operationId: createIssueWorkflow
+    summary: Create a project workflow
+    description: >-
+      server/internal/handler/issue_workflow.go:470-577
+      (`CreateIssueWorkflow`). Any member, gated by project_workflows_v1.
+      Runs inside one transaction holding the EXCLUSIVE issue-status
+      catalog lock (shared with every other catalog/workflow write) so a
+      concurrent status archive or create cannot race step resolution. The
+      caller becomes the workflow's owner.
+    tags: [Issue Workflows]
+    security: *workflowAuth
+    parameters: *workflowHeaders
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/IssueWorkflowWriteRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueWorkflowResponse' }
+      '400':
+        description: Invalid body, a step names a status that doesn't exist (and isn't built-in), a status appears twice, invalid name/description length, name "Default" (reserved), too many steps (>50), an invalid handoff (bad handler type, squad handoff, missing handler id for agent/member, instructions >8000 chars, a next/back status not in this workflow, or handing off from backlog/done/cancelled), or an invalid new_status (bad name/color).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              statusColor: { value: { error: "color must be a 6-digit hex value like #3b82f6" } }
+              invalidWorkflow: { value: { error: "name must be 1-64 characters", code: "invalid_workflow" } }
+              reservedName: { value: { error: "\"Default\" is reserved for the workspace default workflow", code: "invalid_workflow" } }
+              invalidHandoff: { value: { error: "hand off to an agent, a member or the project lead", code: "invalid_handoff" } }
+              handoffHandlerId: { value: { error: "invalid handler id" } }
+      '403':
+        description: project_workflows_v1 is disabled for this workspace, a non-admin named a new_status that doesn't already exist, or an agent/squad handoff names a target the caller may not assign work to.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            examples:
+              featureDisabled: { value: { error: "Project workflows are not enabled", code: "project_workflows_disabled" } }
+              statusCreateForbidden: { value: { error: "only workspace admins can create statuses", code: "status_create_forbidden" } }
+              handoffForbidden: { value: { error: "you do not have permission to assign work to this agent", code: "invalid_handoff" } }
+      '409':
+        description: A workflow with this name already exists in the workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            example: { error: "a workflow with this name already exists", code: "workflow_name_taken" }
+      '500':
+        description: '"failed to save workflow", "failed to load issue statuses", or the handler''s own transaction begin/commit failure message.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-workflows/{id}:
+  get:
+    operationId: getIssueWorkflow
+    summary: Get a project workflow
+    description: >-
+      server/internal/handler/issue_workflow.go:261-280
+      (`GetIssueWorkflow`). Any member. Any error reading the row
+      (not-found or otherwise) is reported identically as 404 — there is no
+      separate 500 path for this operation.
+    tags: [Issue Workflows]
+    security: *workflowAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueWorkflowResponse' }
+      '400':
+        description: id is not a UUID.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid workflow id" }
+      '404':
+        description: Workflow not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "workflow not found" }
+  patch:
+    operationId: updateIssueWorkflow
+    summary: Update a project workflow
+    description: >-
+      server/internal/handler/issue_workflow.go:652-820
+      (`UpdateIssueWorkflow`). Owner of the workflow, or a workspace
+      owner/admin (canEditIssueWorkflow); never gated by
+      project_workflows_v1. Editing the Default workflow ignores a `name`
+      change (its name is fixed) but accepts `description` and `steps`.
+      Runs inside one transaction holding the EXCLUSIVE catalog lock. When
+      the edit would remove a status that issues of the workflow's projects
+      still use, `status_mapping` must cover every one of them with a
+      destination the NEW step list accepts (checked against the proposed
+      steps, not the stored ones) — the remap itself runs in the same
+      transaction as the step update, and a remapped-into done/cancelled
+      status also stops that issue's wakeups, broadcast after commit. The
+      Default workflow accepts every catalog status (archived included), so
+      editing it never requires a status_mapping.
+    tags: [Issue Workflows]
+    security: *workflowAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/IssueWorkflowWriteRequest' }
+    responses:
+      '200':
+        description: >-
+          OK — the updated workflow, OR (when dry_run is true) `{dry_run:
+          true, plan: WorkflowMappingPlan}` instead of an
+          IssueWorkflowResponse, computed but not written. A dry_run on the
+          Default workflow or a workflow with no projects using it yet
+          always returns an empty plan (required: [], unchanged: [],
+          total_issues: 0, affected_issues: 0) without touching the
+          database.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/IssueWorkflowResponse'
+                - type: object
+                  required: [dry_run, plan]
+                  properties:
+                    dry_run: { type: boolean, const: true }
+                    plan: { $ref: '#/components/schemas/WorkflowMappingPlan' }
+      '400':
+        description: Invalid body, id not a UUID, or the same step/handoff/new_status validation failures as create.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidWorkflowId: { value: { error: "invalid workflow id" } }
+              invalidWorkflow: { value: { error: "status \"foo\" does not exist", code: "invalid_workflow" } }
+              invalidHandoff: { value: { error: "instructions must be at most 8000 characters", code: "invalid_handoff" } }
+      '403':
+        description: Caller is neither the workflow's owner nor a workspace owner/admin; a non-admin named a new_status that doesn't already exist; or a handoff names an assignment target the caller may not use.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              role: { value: { error: "only the workflow owner and workspace admins can change this workflow" } }
+              statusCreateForbidden: { value: { error: "only workspace admins can create statuses", code: "status_create_forbidden" } }
+              handoffForbidden: { value: { error: "you do not have permission to assign work to this agent", code: "invalid_handoff" } }
+      '404':
+        description: Workflow not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "workflow not found" }
+      '409':
+        description: Renaming to a name already in use, or the proposed steps drop a status some affected issues are on and status_mapping doesn't (yet) cover all of them.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/WorkflowStatusMappingRequiredResponse'
+            examples:
+              nameTaken: { value: { error: "a workflow with this name already exists", code: "workflow_name_taken" } }
+              mappingRequired: { value: { error: "choose a destination status for the 3 issue(s) on \"triage\"", code: "workflow_status_mapping_required", plan: { required: [{ status_key: "triage", issue_count: 3, suggested_status_key: "todo" }], unchanged: [], total_issues: 3, affected_issues: 3 } } }
+      '500':
+        description: '"failed to save workflow", "failed to load issue statuses", or "failed to move issues to the new statuses" (remap failure after the workflow row itself was already updated in the same, still-open transaction — rolled back together).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+  delete:
+    operationId: deleteIssueWorkflow
+    summary: Delete a project workflow
+    description: >-
+      server/internal/handler/issue_workflow.go:822-889
+      (`DeleteIssueWorkflow`). Same ownership rule as update
+      (canEditIssueWorkflow). The Default workflow can never be deleted,
+      regardless of whether any project uses it. A workflow still used by
+      at least one project cannot be deleted either — switch those projects
+      to another workflow first (POST /api/projects/{id}/workflow, outside
+      this domain's scope). Runs inside one transaction holding the
+      EXCLUSIVE catalog lock.
+    tags: [Issue Workflows]
+    security: *workflowAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '204':
+        description: Deleted.
+      '400':
+        description: id is not a UUID, or the workflow is the Default workflow.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              invalidId: { value: { error: "invalid workflow id" } }
+              isDefault: { value: { error: "the Default workflow cannot be deleted", code: "workflow_is_default" } }
+      '403':
+        description: Caller is neither the workflow's owner nor a workspace owner/admin.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "only the workflow owner and workspace admins can change this workflow" }
+      '404':
+        description: Workflow not found in this workspace (also returned if it was concurrently deleted between the read and the DELETE statement's zero-row result).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "workflow not found" }
+      '409':
+        description: One or more projects still use this workflow.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkflowInUseError' }
+            example: { error: "2 project(s) still use this workflow; switch them to another workflow first", code: "workflow_in_use", project_count: 2 }
+      '500':
+        description: '"failed to delete workflow" (lock/list-projects/delete/commit failures all report this same message).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-workflows/{id}/brief:
+  post:
+    operationId: previewIssueWorkflowBrief
+    summary: Preview the handoff brief for an edited (not-yet-saved) step
+    description: >-
+      server/internal/handler/issue_workflow.go:1281-1360
+      (`PreviewIssueWorkflowBrief`). Any member — no ownership/role gate,
+      unlike writing a workflow. Renders exactly what an agent's run prompt
+      would show for the given step, without saving it. Notably laxer than
+      the write endpoints: it does NOT call issueworkflow.ValidateHandoff,
+      so (confirmed from source, not a gap) it never rejects a squad
+      handoff, an instructions string over 8000 characters, or a
+      next/back_status_key naming a status outside the workflow — only
+      status_key itself is checked against the workflow, and only the
+      handler assignment is checked. The handler-assignment check is
+      SKIPPED entirely when the submitted handler is unchanged from the
+      step's currently-stored handler (performance short-circuit shared
+      with create/update), and on failure reports a bare `Error` (no
+      `code`) rather than invalid_handoff like every other handoff-handler
+      check in this domain — both confirmed from source.
+    tags: [Issue Workflows]
+    security: *workflowAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PreviewIssueWorkflowBriefRequest' }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [brief]
+              properties:
+                brief:
+                  type: string
+                  description: Rendered by issueworkflow.Brief — multi-line Markdown-ish text naming the workflow, the step's instructions, and every status with its handler.
+      '400':
+        description: Invalid body, id not a UUID, or status_key does not name a step of this workflow.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidId: { value: { error: "invalid workflow id" } }
+              badStatus: { value: { error: "status_key is not a column of this workflow" } }
+      '403':
+        description: The submitted (changed) handler names an agent/squad the caller may not assign work to. Plain Error, not ErrorCode — see description.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "you do not have permission to assign work to this agent" }
+      '404':
+        description: Workflow not found in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "workflow not found" }
+      '500':
+        description: '"failed to read workflow" (stored steps failed to decode).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+
+/api/issue-workflows/{id}/handoffs/{status}:
+  put:
+    operationId: setIssueWorkflowHandoff
+    summary: Save (or copy-for-one-project) a workflow step's handoff
+    description: >-
+      server/internal/handler/issue_workflow.go:1091-1187
+      (`SetIssueWorkflowHandoff`), with the copy_for_project_id branch
+      finishing in saveHandoffOnProjectCopy (issue_workflow.go:1192-1247).
+      Same ownership gate as update (canEditIssueWorkflow). The `{status}`
+      path segment IS the step's status_key — see
+      SetIssueWorkflowHandoffRequest's description for why the request
+      body's own status_key field is irrelevant here. Gated by
+      project_workflows_v1 only when the handoff actually hands off
+      (handler.type other than none) or copy_for_project_id is set; saving
+      a plain none handoff on a workflow already past that point (e.g.
+      clearing an existing handoff) succeeds regardless of the flag. Runs
+      inside one transaction holding the EXCLUSIVE catalog lock. Without
+      copy_for_project_id, every project currently using this workflow
+      picks up the new handoff immediately (it is a shared row); with it,
+      only the named project switches (to a new copied row) and the
+      original workflow is untouched.
+    tags: [Issue Workflows]
+    security: *workflowAuth
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: The workflow id.
+      - name: status
+        in: path
+        required: true
+        schema: { type: string }
+        description: The status_key of the step whose handoff is being set. Not independently validated as a known status format — an arbitrary string is accepted and then checked against the workflow's steps by ValidateHandoff.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetIssueWorkflowHandoffRequest' }
+    responses:
+      '200':
+        description: OK — the workflow with its handoff updated (no copy_for_project_id given, or the targeted workflow was Default... see 400 below for that case).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueWorkflowResponse' }
+      '201':
+        description: Created — copy_for_project_id was given and valid; this is the newly created per-project copy of the workflow, already carrying the new handoff.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/IssueWorkflowResponse' }
+      '400':
+        description: Invalid body, id not a UUID, copy_for_project_id not a UUID, an invalid handoff (bad handler type, squad handoff, missing handler id, instructions too long, status not part of this workflow, or a next/back status not on this workflow), or copy_for_project_id names the Default workflow (which cannot be copied for one project).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              invalidCopyTarget: { value: { error: "invalid copy_for_project_id" } }
+              invalidHandoff: { value: { error: "status \"foo\" is not part of this workflow", code: "invalid_handoff" } }
+              copyDefault: { value: { error: "the Default workflow cannot be copied for one project", code: "invalid_handoff" } }
+      '403':
+        description: project_workflows_v1 is disabled (only when this handoff hands off or copies); caller is neither the workflow's owner nor a workspace owner/admin; the handler names an assignment target the caller may not use; or (copy branch) the caller may not manage the named project's workflow.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              featureDisabled: { value: { error: "Project workflows are not enabled", code: "project_workflows_disabled" } }
+              role: { value: { error: "only the workflow owner and workspace admins can change this workflow" } }
+              handoffForbidden: { value: { error: "you do not have permission to assign work to this agent", code: "invalid_handoff" } }
+              copyRole: { value: { error: "only workspace admins and the project lead can change this project's workflow" } }
+      '404':
+        description: Workflow not found in this workspace, or (copy branch) copy_for_project_id does not resolve to a project in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              workflow: { value: { error: "workflow not found" } }
+              project: { value: { error: "project not found" } }
+      '409':
+        description: copy_for_project_id names a project that does not currently use this exact workflow.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ErrorCode' }
+            example: { error: "the project does not use this workflow", code: "invalid_handoff" }
+      '500':
+        description: '"failed to save handoff" (lock/read/validate/write/commit failures in either branch all report this same message).'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
