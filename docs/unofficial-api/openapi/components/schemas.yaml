@@ -108,6 +108,7 @@ ErrorCode:
         - plugin_api_disabled
         - plugin_surfaces_misconfigured
         - plugin_surfaces_not_configured
+        - project_workflows_disabled
         - runtime_profile_has_active_agents
         - seat_capacity_full
         - seat_capacity_overcommitted

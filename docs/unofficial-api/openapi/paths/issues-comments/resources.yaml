@@ -934,6 +934,75 @@
             schema:
               $ref: '#/components/schemas/Error'
 
+/api/issues/{id}/workflow-handoff:
+  get:
+    operationId: previewWorkflowHandoff
+    summary: Preview what moving this issue to a status (or project) would do under its workflow
+    description: >-
+      server/internal/handler/issue_workflow.go:1388-1470
+      (`PreviewWorkflowHandoff`). PPBM-3043 — missing from the original
+      domain pass, found by PPBM-2960's router.go reconciliation. Pure
+      read, writes nothing. Requires `status` and/or `project_id` as query
+      params (at least one). With `project_id`, previews moving the issue
+      into that project and entering whichever workflow step it lands on
+      (status explicit or not). `previous_runs` is only populated when the
+      previewed move would actually change the assignee.
+    tags: [issues]
+    security:
+      - PersonalAccessToken: []
+      - AgentTaskToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: status
+        in: query
+        required: false
+        schema: {type: string}
+        description: Target status to preview moving into. Required unless `project_id` is given.
+      - name: project_id
+        in: query
+        required: false
+        schema: {type: string, format: uuid}
+        description: Target project to preview moving into. Required unless `status` is given; must exist in this workspace.
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkflowHandoffPreviewResponse'
+      '400':
+        description: >-
+          "status is required" (both query params omitted); invalid
+          `project_id`; `status_not_in_workflow` (the given/current status
+          isn't one the project's named workflow lists).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/StatusNotInWorkflowResponse'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '404':
+        description: Issue not found, or (when `project_id` is given) that project does not exist in this workspace.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '500':
+        description: '"failed to resolve project workflow".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
 /api/issues/{id}/subscribers:
   get:
     operationId: listIssueSubscribers

@@ -1,5 +1,8 @@
 # Domain: 계정 부속 리소스 — tokens, me, attachments, webhooks,
-# projects, share-links, cli-token, upload-file (34 endpoints).
+# projects, share-links, cli-token, upload-file (34 endpoints + 4 added by
+# PPBM-3043: client-usage, contact-sales, attachments/{id}/download-metadata,
+# projects/{id}/workflow — found missing from the original pass by PPBM-2960's
+# router.go reconciliation).
 # Top-level keys are path strings merged verbatim into the document's
 # "paths" object by scripts/merge.mjs — add operations here, not under a
 # nested "paths:" key.
@@ -13,6 +16,71 @@
 # user-scoped group (router.go:1639-1640) does not. Fully public routes
 # (no Multica auth at all) and the four externally-authenticated webhook
 # ingress routes are called out per-operation below.
+
+/api/contact-sales:
+  post:
+    operationId: createContactSales
+    summary: Submit the landing-page "Contact Sales" form (public)
+    description: >-
+      server/internal/handler/contact_sales.go:121-247
+      (`CreateContactSales`). Fully public — no Multica auth; registered
+      outside the authenticated route group entirely. Anti-abuse: per-IP
+      rate limit (`RATE_LIMIT_CONTACT_SALES`, default 5/hour) at the
+      router, a per-business-email cap of 3 submissions/hour at the
+      handler, and a business-email-domain check that rejects ~29
+      hardcoded free-mail providers (gmail.com, outlook.com, icloud.com,
+      etc.). Body capped at 16 KiB.
+    tags: [Me]
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CreateContactSalesRequest' }
+    responses:
+      '201':
+        description: Created
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContactSalesResponse' }
+      '400':
+        description: >-
+          "invalid request body"; a required field missing/too long
+          (`first_name`, `last_name`, `company_name`, `country_region`);
+          `business_email` invalid, too long, or not a recognized business
+          domain; `company_size`/`use_case` not one of the fixed enums;
+          `goals` too long.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              firstNameRequired: { value: { error: "first_name is required" } }
+              invalidEmail: { value: { error: "business_email is invalid" } }
+              freeEmailDomain: { value: { error: "please use a business email address" } }
+              invalidCompanySize: { value: { error: "company_size is invalid" } }
+              invalidUseCase: { value: { error: "use_case is invalid" } }
+      '429':
+        description: >-
+          Either the router-level per-IP limit (`RATE_LIMIT_CONTACT_SALES`,
+          default 5/hour — `middleware.RateLimit`, generic body, always
+          with a `Retry-After` header) or the handler-level per-business-email
+          cap (3 submissions/hour).
+        headers:
+          Retry-After:
+            schema: { type: integer }
+            description: Only set by the router-level IP limiter, in seconds (the rate-limit window).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              ipLimited: { value: { error: "too many requests" } }
+              emailLimited: { value: { error: "too many recent inquiries from this email" } }
+      '500':
+        description: '"failed to submit inquiry" — the recent-count check or the insert itself failed.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to submit inquiry" }
 
 /api/me:
   get:
@@ -228,140 +296,6 @@
           application/json:
             schema: { $ref: '#/components/schemas/Error' }
             example: { error: "failed to join waitlist" }
-
-/api/me/onboarding/runtime-bootstrap:
-  post:
-    operationId: bootstrapOnboardingRuntime
-    summary: '[DEPRECATED] Bootstrap onboarding with a runtime (desktop < v3 shim)'
-    description: >-
-      server/internal/handler/onboarding_shim.go:134-352. DEPRECATED — kept
-      only for desktop clients older than v3 (router.go:1657-1664); current
-      clients create the Helper agent + starter issue directly via generic
-      CreateAgent/CreateIssue and call only /api/me/onboarding/complete.
-      Creates (or reuses) a "Multica Helper" agent and a starter issue in
-      one transaction.
-    tags: [Me, Onboarding]
-    deprecated: true
-    security: *userAuth
-    requestBody:
-      required: true
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/BootstrapOnboardingRuntimeRequest' }
-    responses:
-      '200':
-        description: OK
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/BootstrapOnboardingRuntimeResponse' }
-      '400':
-        description: Invalid body, missing/invalid workspace_id or runtime_id, starter_prompt too long, or runtime not found in workspace.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            examples:
-              invalidBody: { value: { error: "invalid request body" } }
-              workspaceIdRequired: { value: { error: "workspace_id is required" } }
-              runtimeIdRequired: { value: { error: "runtime_id is required" } }
-              promptTooLong: { value: { error: "starter_prompt exceeds 2048 characters" } }
-              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
-              invalidRuntimeId: { value: { error: "invalid runtime_id" } }
-      '401':
-        description: Not authenticated.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            example: { error: "user not authenticated" }
-      '402':
-        description: Workspace has reached its Cloud-entitlement issue-count limit.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/IssueLimitReachedError' }
-      '403':
-        description: Not a member of the workspace, or the runtime is private and owned by someone else.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            examples:
-              notAMember: { value: { error: "not a member of this workspace" } }
-              privateRuntime: { value: { error: "this runtime is private; only its owner can create agents on it" } }
-      '500':
-        description: Any step of the onboarding transaction failed (agent/issue creation, allocation, commit, etc.).
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            examples:
-              startFailed: { value: { error: "failed to start onboarding" } }
-              listAgentsFailed: { value: { error: "failed to list agents" } }
-              createAssistantFailed: { value: { error: "failed to create onboarding assistant" } }
-              createIssueFailed: { value: { error: "failed to create onboarding issue" } }
-              allocateFailed: { value: { error: "failed to allocate issue number" } }
-              loadUserFailed: { value: { error: "failed to load user" } }
-              markOnboardedFailed: { value: { error: "failed to mark onboarded" } }
-              starterStateFailed: { value: { error: "failed to record starter content state" } }
-              finishFailed: { value: { error: "failed to finish onboarding" } }
-
-/api/me/onboarding/no-runtime-bootstrap:
-  post:
-    operationId: bootstrapOnboardingNoRuntime
-    summary: '[DEPRECATED] Bootstrap onboarding without a runtime (desktop < v3 shim)'
-    description: >-
-      server/internal/handler/onboarding_shim.go:360-494. DEPRECATED, same
-      status as /api/me/onboarding/runtime-bootstrap. Creates a
-      "Connect a runtime to start using agents" starter issue assigned to
-      the calling member (self), not an agent.
-    tags: [Me, Onboarding]
-    deprecated: true
-    security: *userAuth
-    requestBody:
-      required: true
-      content:
-        application/json:
-          schema: { $ref: '#/components/schemas/BootstrapOnboardingNoRuntimeRequest' }
-    responses:
-      '200':
-        description: OK
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/BootstrapOnboardingNoRuntimeResponse' }
-      '400':
-        description: Invalid body, missing/invalid workspace_id.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            examples:
-              invalidBody: { value: { error: "invalid request body" } }
-              workspaceIdRequired: { value: { error: "workspace_id is required" } }
-              invalidWorkspaceId: { value: { error: "invalid workspace_id" } }
-      '401':
-        description: Not authenticated.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            example: { error: "user not authenticated" }
-      '402':
-        description: Workspace has reached its Cloud-entitlement issue-count limit.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/IssueLimitReachedError' }
-      '403':
-        description: Not a member of the workspace.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            example: { error: "not a member of this workspace" }
-      '500':
-        description: Any step of the onboarding transaction failed.
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/Error' }
-            examples:
-              loadUserFailed: { value: { error: "failed to load user" } }
-              createIssueFailed: { value: { error: "failed to create onboarding issue" } }
-              allocateFailed: { value: { error: "failed to allocate issue number" } }
-              markOnboardedFailed: { value: { error: "failed to mark onboarded" } }
-              starterStateFailed: { value: { error: "failed to record starter content state" } }
-              finishFailed: { value: { error: "failed to finish onboarding" } }
 
 /api/cli-token:
   post:
@@ -895,6 +829,54 @@
             schema: { $ref: '#/components/schemas/Error' }
             example: { error: "failed to read attachment range" }
 
+/api/attachments/{id}/download-metadata:
+  get:
+    operationId: getAttachmentForDownload
+    summary: Get a fresh, natively-loadable attachment URL (user-scoped, not workspace-scoped)
+    description: >-
+      server/internal/handler/file.go:671-677, 805-831
+      (`GetAttachmentForDownload`, `loadAttachmentForDownload`). Same
+      response-shaping (`writeSignedAttachmentMetadata`) as
+      `GET /api/attachments/{id}`, but resolves the workspace from the
+      attachment row itself instead of `X-Workspace-ID`/`X-Workspace-Slug`
+      — this is what lets a persisted `/api/attachments/{id}/download`
+      markdown link be re-signed from a different workspace than the one
+      it was captured in. Always returns signed-mode URLs regardless of
+      the caller's stable-URL capability header. Membership is enforced
+      (404, not 403, on non-membership — same IDOR-safe shape as the
+      `/download` route) but not workspace-header-gated.
+    tags: [Attachments]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    responses:
+      '200':
+        description: OK
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AttachmentResponse' }
+      '400':
+        description: '{id} is not a parseable UUID.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "invalid attachment id" }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '404':
+        description: Attachment not found by id, has no workspace, or the caller is not a member of it (all deliberately indistinguishable, same as `GET /api/attachments/{id}/download`).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "attachment not found" }
+
 /api/upload-file:
   post:
     operationId: uploadFile
@@ -1000,6 +982,72 @@
               internalError: { value: { error: "internal error" } }
               readFailed: { value: { error: "failed to read file" } }
               uploadFailed: { value: { error: "upload failed" } }
+
+/api/client-usage:
+  post:
+    operationId: upsertClientUsage
+    summary: Record one day's client/runtime usage ping (telemetry)
+    description: >-
+      server/internal/handler/client_usage.go:49-176
+      (`UpsertClientUsage`). Human-actor-only (`handler.RequireHumanActor`
+      — an `mat_`/`mcn_` caller is refused). User-scoped; workspace is
+      optional — when `X-Workspace-ID`/`X-Workspace-Slug` resolves to a
+      value, the row additionally records that workspace and the caller
+      must be a member of it. At most one row per (user, client type,
+      install, UTC day); a later report the same day refreshes it in place.
+    tags: [Me]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UpsertClientUsageRequest' }
+    responses:
+      '204':
+        description: Recorded — no body.
+      '400':
+        description: >-
+          "invalid request body" (decode failure, or an unrecognized
+          top-level field — `DisallowUnknownFields`); invalid
+          `install_id`/workspace id; client platform not `web`/`desktop`;
+          invalid client version string; "runtime data is only accepted
+          from desktop"; or any `runtime` validation failure (invalid
+          `probe_result`, inconsistent/missing counts, too many providers,
+          invalid provider name).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+      '401':
+        description: Not authenticated.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "user not authenticated" }
+      '403':
+        description: >-
+          Either `"this endpoint is only available to human actors"`
+          (`RequireHumanActor` rejected an `mat_`/`mcn_` caller — also
+          reflected in `security` above by the absence of `AgentTaskToken`/
+          `CloudNodePAT`), or `"workspace not found"` (resolved workspace
+          does not exist or the caller is not a member, checked under an
+          explicit lock shared with workspace delete).
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              humanOnly: { value: { error: "this endpoint is only available to human actors" } }
+              workspaceNotFound: { value: { error: "workspace not found" } }
+      '500':
+        description: Failed to begin/commit the transaction, or to upsert the usage row.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "failed to record client usage" }
 
 /api/projects:
   get:
@@ -1325,6 +1373,88 @@
               deleteViewsFailed: { value: { error: "failed to delete project views" } }
               deleteFailed: { value: { error: "failed to delete project" } }
               commitFailed: { value: { error: "failed to commit project delete" } }
+
+/api/projects/{id}/workflow:
+  post:
+    operationId: setProjectWorkflow
+    summary: Switch the issue workflow a project uses
+    description: >-
+      server/internal/handler/issue_workflow.go:932-1070
+      (`SetProjectWorkflow`). Workspace-scoped; restricted to workspace
+      owners/admins and the project's lead (`canManageProjectWorkflow`) —
+      narrower than plain membership. Null/empty `workflow_id` switches to
+      the workspace's Default workflow (no feature flag needed); a named
+      workflow requires `project_workflows_v1`. Issues on a status the
+      destination rejects are moved inside the same transaction, to the
+      mapping the caller supplies (or, with `dry_run`, just previewed).
+      The move is purely administrative — it does not reassign issues or
+      start any runs.
+    tags: [Projects]
+    security: *userAuth
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SetProjectWorkflowRequest' }
+    responses:
+      '200':
+        description: OK — `dry_run: true` returns only `dry_run`/`plan`; otherwise the full write response.
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/SetProjectWorkflowDryRunResponse'
+                - $ref: '#/components/schemas/SetProjectWorkflowResponse'
+      '400':
+        description: '"invalid request body"; invalid `workflow_id`; `workflow_id` does not resolve to a workflow in this workspace ("workflow not found in this workspace"); invalid project/workspace id.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              invalidBody: { value: { error: "invalid request body" } }
+              workflowNotFound: { value: { error: "workflow not found in this workspace" } }
+      '403':
+        description: >-
+          `project_workflows_disabled` (ErrorCode, adopting a named
+          workflow while the `project_workflows_v1` flag is off), or
+          `"only workspace admins and the project lead can change this
+          project's workflow"` (plain Error, caller fails
+          `canManageProjectWorkflow`).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/ErrorCode'
+                - $ref: '#/components/schemas/Error'
+            examples:
+              featureDisabled: { value: { error: "Project workflows are not enabled", code: "project_workflows_disabled" } }
+              notPermitted: { value: { error: "only workspace admins and the project lead can change this project's workflow" } }
+      '404':
+        description: Project not found, or not in this workspace.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            example: { error: "project not found" }
+      '409':
+        description: '`status_mapping` is missing a required entry, or supplies a target status the destination workflow does not accept.'
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkflowStatusMappingRequiredResponse' }
+      '500':
+        description: Failed to lock the status catalog/project, load the target workflow, load issue-status counts, apply the write, or commit.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Error' }
+            examples:
+              changeFailed: { value: { error: "failed to change workflow" } }
+              remapFailed: { value: { error: "failed to move issues to the new statuses" } }
 
 /api/projects/{id}/resources:
   get:

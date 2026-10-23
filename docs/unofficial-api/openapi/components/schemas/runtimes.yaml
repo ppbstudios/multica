@@ -861,3 +861,100 @@ RuntimeProfileInstanceDeleteRefusal:
     undrained_task_count:
       type: integer
       description: Present only alongside `active_agent_count` (same `known` gate).
+
+# ---------------------------------------------------------------------------
+# POST /api/runtimes/{runtimeId}/revoke-workspace-access (PPBM-3043 — missing
+# from the original domain pass). server/internal/handler/runtime.go:1039-1127
+# (`RevokeRuntimeWorkspaceAccess`).
+# ---------------------------------------------------------------------------
+
+RevokeRuntimeWorkspaceAccessRequest:
+  type: object
+  description: >-
+    The non-owner agent/task snapshot the confirmation dialog showed when
+    it opened (from the normal `PATCH .../{runtimeId}` visibility-change
+    409 plan below). Both fields re-validated as an exact set match
+    (same size, same ids) against a fresh, row-locked read inside the
+    transaction before anything is torn down.
+  properties:
+    expected_nonowner_agent_ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: May be omitted/empty — an empty set is a valid plan ("I confirmed nothing non-owner is bound").
+    expected_task_ids:
+      type: array
+      items: { type: string, format: uuid }
+      description: Active (non-terminal) tasks belonging to non-owner agents on this runtime, at dialog-open time.
+
+RuntimeAccessRevocationPlanResponse:
+  type: object
+  description: >-
+    server/internal/handler/runtime.go:776-796
+    (`runtimeWorkspaceAccessRevocationResponse`). Shared 409 body shape,
+    distinguished by `code`: `runtime_has_nonowner_dependents` from the
+    normal `PATCH .../{runtimeId}` visibility change (public → private)
+    discovering dependents on its own no-op-if-clean fast path (that PATCH
+    response is otherwise out of this ticket's 11-endpoint scope and not
+    independently re-documented here), and `runtime_access_revocation_plan_changed`
+    from this endpoint when the confirmed snapshot in the request no longer
+    matches a fresh read. NOT the shared `ErrorCode` schema — carries
+    `nonowner_agents`/`active_task_ids` it doesn't have room for.
+  required: [error, code, nonowner_agents, active_task_ids]
+  properties:
+    error:
+      type: string
+      enum:
+        - 'making this runtime private will unbind teammates'' agents, cancel their active runs, and pause their active autopilots; review and confirm first.'
+        - 'the runtime access plan changed; please review and confirm again.'
+    code:
+      type: string
+      enum: [runtime_has_nonowner_dependents, runtime_access_revocation_plan_changed]
+    nonowner_agents:
+      type: array
+      items:
+        type: object
+        required: [id, name]
+        properties:
+          id: { type: string, format: uuid }
+          name: { type: string }
+        description: Deliberately a narrow `{id, name}` projection, not the full `AgentResponse` — runtime ownership does not grant access to a teammate's private agent configuration.
+    active_task_ids:
+      type: array
+      items: { type: string, format: uuid }
+
+RuntimeAccessRevocationConflict:
+  type: object
+  description: >-
+    Plain `{error, code}` 409 bodies for the two non-plan conflict cases.
+    `runtime_access_revocation_not_required` — the runtime is already
+    private (refresh raced with another change). `runtime_access_revocation_busy` —
+    the locked-read step hit Postgres `55P03` (lock_not_available) on one
+    of the runtime's bound-agent/chat-session rows; the caller should
+    retry. Neither code is in the shared `ErrorCode` schema's enum
+    (flagged in this ticket's final report).
+  required: [error, code]
+  properties:
+    error:
+      type: string
+      enum:
+        - 'this runtime is already private; refresh before trying again.'
+        - 'runtime work is changing; retry to review the current plan.'
+    code:
+      type: string
+      enum: [runtime_access_revocation_not_required, runtime_access_revocation_busy]
+
+RuntimeWorkspaceAccessRevocationResponse:
+  type: object
+  description: 200 body — the runtime is now private and every non-owner dependent has been torn down.
+  required: [runtime, agents_unbound, tasks_cancelled, autopilots_paused]
+  properties:
+    runtime: { $ref: '#/components/schemas/AgentRuntimeResponse' }
+    agents_unbound:
+      type: integer
+      description: Non-owner agents unbound from the runtime (they keep their configuration/chats and need a new runtime to run again).
+    tasks_cancelled:
+      type: integer
+      description: Non-owner active tasks cancelled on this runtime.
+    autopilots_paused:
+      type: integer
+      description: Autopilots paused because their bound agent was just unbound.

@@ -180,74 +180,6 @@ CliTokenResponse:
     token:
       type: string
 
-BootstrapOnboardingRuntimeRequest:
-  type: object
-  description: >-
-    server/internal/handler/onboarding_shim.go:108-112. DEPRECATED shim for
-    desktop < v3 clients only (router.go:1657-1664) — current clients do
-    not call this.
-  required: [workspace_id, runtime_id]
-  properties:
-    workspace_id:
-      type: string
-      format: uuid
-    runtime_id:
-      type: string
-      format: uuid
-    starter_prompt:
-      type: string
-      maxLength: 2048
-      description: Rune-counted cap (onboarding_shim.go:51, 154-156).
-
-BootstrapOnboardingRuntimeResponse:
-  type: object
-  description: onboarding_shim.go:114-118.
-  required: [workspace_id, agent_id, issue_id]
-  properties:
-    workspace_id: { type: string, format: uuid }
-    agent_id: { type: string, format: uuid }
-    issue_id: { type: string, format: uuid }
-
-BootstrapOnboardingNoRuntimeRequest:
-  type: object
-  description: >-
-    server/internal/handler/onboarding_shim.go:120-122. DEPRECATED shim,
-    same status as BootstrapOnboardingRuntimeRequest.
-  required: [workspace_id]
-  properties:
-    workspace_id:
-      type: string
-      format: uuid
-
-BootstrapOnboardingNoRuntimeResponse:
-  type: object
-  description: onboarding_shim.go:124-127.
-  required: [workspace_id, issue_id]
-  properties:
-    workspace_id: { type: string, format: uuid }
-    issue_id: { type: string, format: uuid }
-
-IssueLimitReachedError:
-  type: object
-  description: >-
-    402 body written by `writeIssueLimitReached` (handler/issue_limit.go:37-49),
-    used by both onboarding shim endpoints when the workspace's Cloud
-    issue-count entitlement is exhausted. Deliberately not folded into the
-    shared `ErrorCode` enum: it carries extra structured fields that enum
-    does not model.
-  required: [error, code, limit, policy_revision]
-  properties:
-    error:
-      type: string
-      const: workspace has reached its issue limit
-    code:
-      type: string
-      const: issue_limit_reached
-    limit:
-      type: integer
-    policy_revision:
-      type: integer
-
 # ---------------------------------------------------------------------------
 # /api/tokens, /api/cli-token (CreatePAT etc.)
 # ---------------------------------------------------------------------------
@@ -603,6 +535,200 @@ UpdateProjectRequest:
     lead_id: { type: [string, "null"], format: uuid }
     start_date: { type: [string, "null"], description: '`YYYY-MM-DD`, or null/empty to clear.' }
     due_date: { type: [string, "null"], description: '`YYYY-MM-DD`, or null/empty to clear.' }
+
+# ---------------------------------------------------------------------------
+# POST /api/projects/{id}/workflow (PPBM-3043 — missing from the original
+# domain pass). server/internal/handler/issue_workflow.go:932-1070
+# (`SetProjectWorkflow`).
+# ---------------------------------------------------------------------------
+
+SetProjectWorkflowRequest:
+  type: object
+  description: >-
+    `workflow_id: null` (or omitted) switches the project back to the
+    workspace's Default workflow. A non-null, non-empty `workflow_id`
+    requires the `project_workflows_v1` feature flag
+    (`project_workflows_disabled`, 403 ErrorCode).
+  properties:
+    workflow_id:
+      type: [string, "null"]
+      format: uuid
+    status_mapping:
+      type: object
+      additionalProperties: { type: string }
+      description: >-
+        Required only for statuses the target workflow would otherwise
+        reject — see `WorkflowStatusMappingRequiredResponse`. Maps each
+        rejected status key to the status key issues on it move to.
+    dry_run:
+      type: boolean
+      default: false
+      description: When true, computes and returns the mapping plan without writing anything (ignores `status_mapping`).
+
+WorkflowMappingPlan:
+  type: object
+  description: >-
+    issue_workflow.go:115-120 (`workflowMappingPlan`, internal name, not a
+    wire-visible type name). Census of which of the project's current issue
+    statuses the destination (new workflow, or Default) does/doesn't accept.
+  required: [required, unchanged, total_issues, affected_issues]
+  properties:
+    required:
+      type: array
+      items: { $ref: '#/components/schemas/StatusMappingRequirement' }
+      description: Statuses the destination rejects; each needs an explicit mapping target.
+    unchanged:
+      type: array
+      items: { $ref: '#/components/schemas/StatusIssueCount' }
+      description: Statuses the destination already accepts as-is.
+    total_issues:
+      type: integer
+      format: int64
+    affected_issues:
+      type: integer
+      format: int64
+
+StatusMappingRequirement:
+  type: object
+  required: [status_key, issue_count, suggested_status_key]
+  properties:
+    status_key: { type: string }
+    issue_count: { type: integer, format: int64 }
+    suggested_status_key:
+      type: string
+      description: >-
+        Precomputed suggestion — the workflow's own move-target resolution
+        for Default, or the status's category match in the target
+        workflow — offered as a sensible default, not a requirement to use it.
+
+StatusIssueCount:
+  type: object
+  required: [status_key, issue_count]
+  properties:
+    status_key: { type: string }
+    issue_count: { type: integer, format: int64 }
+
+SetProjectWorkflowResponse:
+  type: object
+  description: 200 body on a non-dry-run write. `plan` reflects the mapping that was actually applied.
+  required: [project, updated_issues, plan]
+  properties:
+    project: { $ref: '#/components/schemas/ProjectResponse' }
+    updated_issues:
+      type: integer
+      description: Count of issues remapped to a new status as part of this workflow change.
+    plan: { $ref: '#/components/schemas/WorkflowMappingPlan' }
+
+SetProjectWorkflowDryRunResponse:
+  type: object
+  description: 200 body when `dry_run: true` — computes the plan without writing.
+  required: [dry_run, plan]
+  properties:
+    dry_run:
+      type: boolean
+      const: true
+    plan: { $ref: '#/components/schemas/WorkflowMappingPlan' }
+
+WorkflowStatusMappingRequiredResponse:
+  type: object
+  description: >-
+    409 written by `writeMappingRequired` (issue_workflow.go:615-621) when
+    `status_mapping` is missing a required entry, or a supplied target is
+    not accepted by the destination workflow. NOT the shared `ErrorCode`
+    schema — carries `plan` in addition to `error`/`code`.
+  required: [error, code, plan]
+  properties:
+    error:
+      type: string
+      description: 'e.g. "choose a destination status for the 3 issue(s) on \"triage\"".'
+    code:
+      type: string
+      const: workflow_status_mapping_required
+    plan: { $ref: '#/components/schemas/WorkflowMappingPlan' }
+
+# ---------------------------------------------------------------------------
+# POST /api/client-usage (PPBM-3043). server/internal/handler/client_usage.go
+# (`UpsertClientUsage`). Human-actor-only (handler.RequireHumanActor).
+# ---------------------------------------------------------------------------
+
+UpsertClientUsageRequest:
+  type: object
+  description: >-
+    Decoded with `DisallowUnknownFields` — an unrecognized top-level key is
+    a 400. At most one row per (user, install, UTC day) is kept; repeat
+    reports the same day refresh that row and never clear an
+    already-collected runtime snapshot with an activity-only report.
+  required: [install_id]
+  properties:
+    install_id:
+      type: string
+      format: uuid
+      description: Client-generated per-installation id.
+    runtime:
+      $ref: '#/components/schemas/ClientUsageRuntimeProbe'
+
+ClientUsageRuntimeProbe:
+  type: object
+  description: >-
+    Only accepted when the request's resolved client platform (from
+    connection metadata, not a request field) is `desktop` — 400 "runtime
+    data is only accepted from desktop" otherwise.
+  required: [probe_result]
+  properties:
+    probe_result:
+      type: string
+      enum: [success, error]
+    runtime_count:
+      type: integer
+      description: Required together with `provider_summary`/`online_count`/`offline_count` when `probe_result` is `success`; must equal `online_count + offline_count`, and must be absent when `probe_result` is `error`.
+    provider_summary:
+      type: object
+      additionalProperties: { type: integer }
+      description: Provider name (`^[a-z0-9][a-z0-9_-]{0,63}$`) to count; at most 32 entries, and the counts must sum to `runtime_count`.
+    online_count:
+      type: integer
+    offline_count:
+      type: integer
+
+# ---------------------------------------------------------------------------
+# POST /api/contact-sales (PPBM-3043). Public — no Multica auth. server/
+# internal/handler/contact_sales.go (`CreateContactSales`).
+# ---------------------------------------------------------------------------
+
+CreateContactSalesRequest:
+  type: object
+  description: >-
+    Rate-limited per-IP at the router (RATE_LIMIT_CONTACT_SALES, default
+    5/hour) and per-email at the handler (3/hour,
+    `CountRecentContactSalesByEmail`). `business_email` is rejected if its
+    domain is on a hardcoded free-mail-provider blocklist (gmail.com,
+    outlook.com, icloud.com, etc. — ~29 domains).
+  required: [first_name, last_name, business_email, company_name, company_size, country_region, use_case]
+  properties:
+    first_name: { type: string, maxLength: 80 }
+    last_name: { type: string, maxLength: 80 }
+    business_email: { type: string, format: email, maxLength: 254 }
+    company_name: { type: string, maxLength: 200 }
+    company_size:
+      type: string
+      enum: ["1-10", "11-50", "51-200", "201-500", "501-1000", "1000+"]
+    country_region: { type: string, maxLength: 80 }
+    use_case:
+      type: string
+      enum: [evaluate, adopt_team, self_host, integrate, partner, other]
+    goals: { type: string, maxLength: 2000 }
+    source:
+      type: string
+      description: 'Frontend sends one of `page`/`onboarding`/`agents_page`; empty/omitted defaults to `page`. Any other value is accepted but collapses to `other` only in the derived metric label, not in the stored row.'
+    consent_outreach: { type: boolean }
+    consent_updates: { type: boolean }
+
+ContactSalesResponse:
+  type: object
+  required: [id, created_at]
+  properties:
+    id: { type: string, format: uuid }
+    created_at: { type: string, format: date-time }
 
 DaemonVersionUnsupportedError:
   type: object

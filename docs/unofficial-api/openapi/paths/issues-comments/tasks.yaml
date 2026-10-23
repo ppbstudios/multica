@@ -79,6 +79,190 @@
             schema:
               $ref: '#/components/schemas/Error'
 
+/api/issues/{id}/tasks/{taskId}/supplements:
+  post:
+    operationId: createTaskSupplement
+    summary: Steer a running agent turn with an additional message
+    description: >-
+      server/internal/handler/task_supplement.go:218-303
+      (`CreateTaskSupplement`). PPBM-3043 — missing from the original
+      domain pass, found by PPBM-2960's router.go reconciliation.
+      Human-actor-only (`handler.RequireHumanActor`). Adds one ordinary
+      comment to the issue that is simultaneously bound to this exact
+      run as a "steering message" the running daemon picks up mid-turn.
+      `client_request_id` makes a resubmission idempotent — a repeat with
+      the same (task, author, client_request_id) returns the original
+      comment again with `200`, not a duplicate `201`. The run must still
+      be `running` and its daemon must advertise the task-supplement
+      capability, or the request is refused rather than silently queued
+      for a turn that will never read it.
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: taskId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+        description: Must belong to this issue, or "task not found".
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CreateTaskSupplementRequest'
+    responses:
+      '200':
+        description: Idempotent replay — `client_request_id` was already used for this (task, author); returns the existing comment unchanged.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentResponse'
+      '201':
+        description: Created — the new steering comment, with its delivery receipt embedded (`supplements`/`supplement_*` fields).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentResponse'
+      '400':
+        description: '"invalid request body"; "content is too long"; "content is required"; invalid `client_request_id`/`workspace_id`/`user_id`/`task_id`.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"this endpoint is only available to human actors"; or `invocation_not_allowed` (caller cannot invoke the task''s agent).'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"task not found" — missing, or belongs to a different issue.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: '`task_supplement_turn_ended` — the run is no longer `running` (checked both before and, as a race fallback, on the insert itself); or a plain `"client_request_id is already in use"` on a unique-constraint race that the idempotent lookup did not catch.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+            examples:
+              turnEnded: { value: { error: "this run has ended", code: "task_supplement_turn_ended" } }
+              requestIdReused: { value: { error: "client_request_id is already in use" } }
+      '412':
+        description: '`task_supplement_unsupported` — the run''s daemon does not advertise the task-supplement capability.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+            example: { error: "this run does not support additional messages", code: "task_supplement_unsupported" }
+      '500':
+        description: '"failed to check additional message"; "failed to create additional message".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+/api/issues/{id}/tasks/{taskId}/supplements/{commentId}/retry:
+  post:
+    operationId: retryTaskSupplement
+    summary: Retry delivering a steering message the daemon failed to pick up
+    description: >-
+      server/internal/handler/task_supplement.go:344-374
+      (`RetryTaskSupplement`). PPBM-3043 — missing from the original
+      domain pass, found by PPBM-2960's router.go reconciliation.
+      Human-actor-only (`handler.RequireHumanActor`).
+
+      Path-list discrepancy found and corrected here: the originating
+      ticket lists this route as `POST .../supplements/retry` (no
+      `{commentId}`). router.go has exactly one matching registration,
+      `r.With(handler.RequireHumanActor).Post("/tasks/{taskId}/supplements/{commentId}/retry",
+      h.RetryTaskSupplement)` — the true path includes `{commentId}`,
+      registered below under the corrected full path, same handler.
+
+      A duplicate retry of a supplement that is still `pending` is treated
+      as an idempotent success rather than an error.
+    tags: [issues, tasks]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceIDHeader'
+      - $ref: '#/components/parameters/WorkspaceSlugHeader'
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+        description: UUID or `PREFIX-NUMBER` identifier.
+      - name: taskId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+        description: Must belong to this issue, or "task not found".
+      - name: commentId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+        description: The comment whose supplement delivery is being retried.
+    responses:
+      '200':
+        description: OK — the supplement's (possibly unchanged, if the retry was a duplicate-of-pending) delivery receipt.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskSupplementReceiptResponse'
+      '400':
+        description: 'Invalid `comment_id`/`workspace_id`/`user_id`/`task_id`.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        description: '"this endpoint is only available to human actors"; or `invocation_not_allowed`.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/ErrorCode'
+      '404':
+        description: '"task not found".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '409':
+        description: '`task_supplement_not_retryable` — no matching, retryable supplement row for this (comment, task).'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorCode'
+            example: { error: "this message cannot be retried", code: "task_supplement_not_retryable" }
+      '500':
+        description: '"failed to retry additional message".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
 /api/issues/{id}/task-runs:
   get:
     operationId: listTasksByIssue
@@ -419,6 +603,86 @@
               $ref: '#/components/schemas/Error'
       '500':
         description: '"failed to record evaluation".'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+
+# ---------------------------------------------------------------------------
+# PPBM-3043 — missing from the original domain pass, found by PPBM-2960's
+# router.go reconciliation. Not nested under /api/issues/{id} — a top-level
+# /api/tasks/{taskId} route — but documented here as the closest existing
+# tasks-domain home (server/internal/handler/task_lifecycle.go, shares its
+# response type and retry semantics with /api/issues/{id}/rerun above).
+# ---------------------------------------------------------------------------
+
+/api/tasks/{taskId}/retry-source-context:
+  post:
+    operationId: retrySourceContextQuickCreate
+    summary: Retry a failed issue-less quick-create that was capturing a source context
+    description: >-
+      server/internal/handler/task_lifecycle.go:234-273
+      (`RetrySourceContextQuickCreate`). Human-actor-only
+      (`handler.RequireHumanActor`). Manually re-enqueues a failed
+      quick-create task, atomically moving its pending immutable source
+      context (captured via `POST /api/comments/{commentId}/sub-issues`
+      with `mode: agent`) onto the fresh retry task. Workspace is resolved
+      from context (the authenticated session's current workspace), not a
+      request header. Requires the original requester and passes the
+      normal private-agent invoke gate again.
+    tags: [tasks]
+    security:
+      - PersonalAccessToken: []
+      - BrowserSession: []
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    responses:
+      '202':
+        description: Accepted — fresh retry task enqueued.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueTaskResponse'
+      '400':
+        description: 'Invalid `workspace_id`/`user_id`/`task_id`; or any other error surfaced verbatim from the retry service.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Error'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '402':
+        description: Workspace issue-count limit reached.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueLimitReachedResponse'
+      '403':
+        description: >-
+          "this endpoint is only available to human actors"; or dispatch
+          blocked (`ReasonInvocationNotAllowed` — the caller cannot invoke
+          the target agent).
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Error'
+                - $ref: '#/components/schemas/DispatchBlockedResponse'
+      '409':
+        description: '`source_context_retry_unavailable` — the captured context can no longer be retried (e.g. superseded by a later branch point).'
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [error, code]
+              properties:
+                error: { type: string }
+                code: { type: string, const: source_context_retry_unavailable }
+      '500':
+        description: '"retry source context quick create".'
         content:
           application/json:
             schema:
